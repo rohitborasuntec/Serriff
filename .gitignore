@@ -1,8 +1,15 @@
 serff_progress.json
 serff_table_data.json
 HTML
-Downloads
 Screenshots
 Logs
 myenv
 .env
+.serff_chrome_profile
+~lock.*
+*.stale-*
+Downloads/
+Output Data/
+Not down.xlsx
+serff_progress.json
+serff_table_data.json

@@ -10,23 +10,37 @@ PHASE 1  COLLECT   search -> 100 rows per page -> save every data-rk (filing id)
                    of every results page into serff_table_data.json
 PHASE 2  DOWNLOAD  open each filing by URL -> save HTML -> download ZIP
 
-Download folder model (matches the reference script):
-    - ONE folder: SerffConfig.download_dir
-    - Chrome writes there because driver.py sets download.default_directory
-    - The scanner reads the same path via self.config.download_dir
-    - No CDP Browser.setDownloadBehavior call — prefs are the single
-      source of truth so writing and scanning can never disagree.
+Date window (REQUIRED — no fallback):
+    serff_window.json must exist in the same directory as this file:
+        {"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}
+    If it is missing or malformed, the run aborts with DateWindowError.
+
+Folder layout (per successful filing):
+    Output Data/{YYYY-MM-DD}/{Code}/{filingId}/{filingId}.zip
+    Output Data/{YYYY-MM-DD}/{Code}/{filingId}/{filingId}.html
+
+When every row in Urls.xlsx is Completed, the window rolls back one calendar
+month, serff_window.json is rewritten, and Urls.xlsx is stamped with:
+    Last Comp Date   -> today's date
+    File Path        -> Output Data/{today}/{Code}/
+
+Failed filings (filing page failed, button click failed, ZIP never arrived)
+are written to:
+    Not down.xlsx   (columns: Website, File Url, ID)
 
 Run:
     python3 -m src.automation.serff
 """
-
 import json
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
+from random import randint
+
+import pandas as pd
 
 from selenium.common.exceptions import (
     StaleElementReferenceException,
@@ -34,14 +48,13 @@ from selenium.common.exceptions import (
     UnexpectedAlertPresentException,
     WebDriverException,
 )
-
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
+
 from src.commons import *
-from src.automation.driver import Browser            # <-- ADJUST
-from src.logging import logger                       # same import your utils uses
-from random import randint
+from src.automation.driver import Browser            # <-- ADJUST if path differs
+from src.logging import logger
 
 
 # =============================================================
@@ -52,17 +65,107 @@ class SessionAbort(Exception):
     """Too many consecutive failures; stop the run (JSON state is kept for resume)."""
 
 
+class DateWindowError(Exception):
+    """serff_window.json is missing, unreadable, or malformed."""
+
+
+# =============================================================
+# DATE-WINDOW FILE  (REQUIRED)
+# =============================================================
+
+class DateWindow:
+    """
+    Loads / persists serff_window.json:
+        {"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}
+
+    The SERFF UI expects MM/DD/YY, so we expose .start_mmddyy / .end_mmddyy
+    for the search form. If the file is missing or invalid, the constructor
+    raises DateWindowError — there are no default dates.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.start, self.end = self._load_required()
+
+    # ---------- disk I/O ----------
+    def _load_required(self):
+        if not self.path.is_file():
+            raise DateWindowError(
+                f"Missing date window file: {self.path}\n"
+                f"Create it with: "
+                f'{{"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}'
+            )
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            start = date.fromisoformat(str(data["start_date"]))
+            end = date.fromisoformat(str(data["end_date"]))
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            raise DateWindowError(
+                f"Invalid date window file {self.path}: {exc}"
+            ) from exc
+
+        if start > end:
+            raise DateWindowError(
+                f"start_date ({start}) is after end_date ({end}) in {self.path}"
+            )
+        logger.info(f"Date window loaded: {start.isoformat()} .. {end.isoformat()}")
+        return start, end
+
+    def _save(self, start: date, end: date):
+        payload = {
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+        }
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+        logger.info(f"Date window saved: {self.path} -> {payload}")
+
+    # ---------- mutation ----------
+    def set(self, start: date, end: date):
+        if start > end:
+            raise DateWindowError(f"Refusing to save inverted window: {start} > {end}")
+        self.start, self.end = start, end
+        self._save(start, end)
+
+    def roll_back_to_previous_month(self):
+        new_start = self._shift_month(self.start, -1)
+        new_end = self._shift_month(self.end, -1)
+        self.set(new_start, new_end)
+        return new_start, new_end
+
+    @staticmethod
+    def _shift_month(d: date, delta_months: int) -> date:
+        month = d.month + delta_months
+        year = d.year + (month - 1) // 12
+        month = (month - 1) % 12 + 1
+        next_month = date(year + (month == 12), (month % 12) + 1, 1)
+        last_day = (next_month - pd.Timedelta(days=1)).day
+        return date(year, month, min(d.day, last_day))
+
+    # ---------- display formats ----------
+    @property
+    def start_mmddyy(self) -> str:
+        return self.start.strftime("%m/%d/%y")
+
+    @property
+    def end_mmddyy(self) -> str:
+        return self.end.strftime("%m/%d/%y")
+
+    def as_dict(self) -> dict:
+        return {"start_date": self.start.isoformat(), "end_date": self.end.isoformat()}
+
+
 # =============================================================
 # CONFIGURATION
 # =============================================================
 
 @dataclass
 class SerffConfig:
-    """All tunable settings in one place."""
+    """All tunable settings in one place. No dates — they come from DateWindow."""
 
     state: str = "AL"
-    start_date: str = "01/01/26"
-    end_date: str = "10/14/26"
 
     # Timeouts (seconds)
     element_timeout: int = 30
@@ -70,7 +173,7 @@ class SerffConfig:
     search_result_timeout: int = 60
     verification_timeout: int = 300
 
-    # Verification: each attempt costs a 2Captcha solve, so cap them.
+    # Verification
     max_captcha_attempts: int = 3
     post_solve_wait: int = 3
 
@@ -79,20 +182,19 @@ class SerffConfig:
     rows_per_page: str = "100"
 
     # Retry / recovery
-    max_refreshes: int = 3               # driver.refresh() tries for a stuck page
-    refresh_backoff: int = 3             # seconds, multiplied by the try number
-    max_row_retries: int = 3             # attempts per filing before it is marked failed
-    max_collect_failures: int = 6        # consecutive failures while collecting ids
-    max_consecutive_restarts: int = 5    # session restarts without any progress in between
-    max_session_attempts: int = 3        # tries to log back in when (re)creating a session
-    restart_cooldown: int = 10           # seconds, multiplied by the restart number (max x3)
+    max_refreshes: int = 3
+    refresh_backoff: int = 3
+    max_row_retries: int = 3
+    max_collect_failures: int = 6
+    max_consecutive_restarts: int = 5
+    max_session_attempts: int = 3
+    restart_cooldown: int = 10
 
     # Search filters
-    business_type_index: int = 2          # option[3]
+    business_type_index: int = 2
     insurance_target: str = "LTC06 Long Term Care - Other"
 
     # Direct filing URL. data-rk of a row == filingId.
-    # VERIFY ONCE: click any result row by hand and compare the address bar.
     filing_url_template: str = (
         "https://serff-sfa.naic.org/serff/sfa/search/filingSummary.xhtml?filingId={id}"
     )
@@ -100,16 +202,19 @@ class SerffConfig:
     # Paths
     base_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent)
 
-    # Project-local Downloads folder — one source of truth for Chrome
-    # (via driver.py prefs) and the scanner (_completed_downloads).
     download_dir: Path = field(
         default_factory=lambda: Path(__file__).resolve().parent / "Downloads"
     )
 
-    @property
-    def base_url(self):
-        return f"https://serff-sfa.naic.org/serff/sfa/home/{self.state}"
+    output_root: Path = field(
+        default_factory=lambda: Path(__file__).resolve().parent / "Output Data"
+    )
 
+    not_downloaded_xlsx: str = "Not down.xlsx"
+    input_csv = "Urls.xlsx"
+    window_json = "serff_window.json"
+
+    # ---------- derived paths ----------
     @property
     def progress_json(self):
         return self.base_dir / "serff_progress.json"
@@ -118,15 +223,36 @@ class SerffConfig:
     def table_data_json(self):
         return self.base_dir / "serff_table_data.json"
 
+    @property
+    def window_json_path(self):
+        return self.base_dir / self.window_json
+
+    @property
+    def today_dir(self) -> Path:
+        return self.output_root / datetime.now().strftime("%Y-%m-%d")
+
     def filing_url(self, data_rk):
         return self.filing_url_template.format(id=data_rk)
 
-    def criteria(self):
+    def code_dir(self, code) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(code or "unknown"))
+        return self.today_dir / safe
+
+    def filing_dir(self, code, data_rk) -> Path:
+        return self.code_dir(code) / str(data_rk)
+
+    def filing_zip_path(self, code, data_rk) -> Path:
+        return self.filing_dir(code, data_rk) / f"{data_rk}.zip"
+
+    def filing_html_path(self, code, data_rk) -> Path:
+        return self.filing_dir(code, data_rk) / f"{data_rk}.html"
+
+    def criteria(self, start_date: str, end_date: str):
         """Identifies the search; saved JSON from a different search is archived."""
         return {
             "state": self.state,
-            "start_date": self.start_date,
-            "end_date": self.end_date,
+            "start_date": start_date,
+            "end_date": end_date,
             "business_type_index": self.business_type_index,
             "insurance_target": self.insurance_target,
             "rows_per_page": self.rows_per_page,
@@ -355,28 +481,36 @@ class Serff:
 
     def __init__(self, config=None, browser=None):
         self.config = config or SerffConfig()
+
+        # REQUIRED date window — raises DateWindowError if missing/invalid.
+        self.window = DateWindow(self.config.window_json_path)
+
         self.browser = browser or Browser(
             headless=False,
-            download_dir=str(self.config.download_dir),   # same path as prefs & scanner
+            download_dir=str(self.config.download_dir),
         )
         self.driver = None
         self.store = ProgressStore(
-            self.config.progress_json, self.config.table_data_json, self.config.criteria()
+            self.config.progress_json,
+            self.config.table_data_json,
+            self.config.criteria(self.window.start_mmddyy, self.window.end_mmddyy),
         )
         self._restarts = 0
         self._collect_failures = 0
+        self._failed_rows = []
 
     # ---------------------------------------------------------
     # Driver lifecycle
     # ---------------------------------------------------------
-
     def start_browser(self):
         logger.info("Starting Chrome WebDriver.")
         self.driver = self.browser.get_chrome()
         self.driver.set_page_load_timeout(self.config.page_load_timeout)
         self.config.download_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Chrome WebDriver started; downloads -> {self.config.download_dir}")
-    
+        self.config.today_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Chrome WebDriver started; staging downloads -> {self.config.download_dir}")
+        logger.info(f"Final output root -> {self.config.output_root}")
+
     def close(self):
         if not self.driver:
             return
@@ -390,7 +524,7 @@ class Serff:
             self.driver = None
 
     # ---------------------------------------------------------
-    # Small wrappers around your utils
+    # Small wrappers
     # ---------------------------------------------------------
     def _screenshot(self, name):
         if self.driver is None:
@@ -643,9 +777,9 @@ class Serff:
     # ---------------------------------------------------------
     # Session: home -> BEGIN SEARCH -> ACCEPT
     # ---------------------------------------------------------
-    def open_site(self):
+    def open_site(self, url=None):
         logger.info("STEP 2: Opening SERFF website.")
-        self._load_page(self.config.base_url)
+        self._load_page(url)
         self._log_page_info()
         return self.handle_verification()
 
@@ -673,15 +807,15 @@ class Serff:
         self._wait_with_refresh(Locators.START_DATE, "Start Submission Date input")
         return True
 
-    def establish_session(self):
+    def establish_session(self, url=None):
         if self.driver is None:
             self.start_browser()
-        return self.open_site() and self.begin_search() and self.accept_terms()
+        return self.open_site(url) and self.begin_search() and self.accept_terms()
 
-    def establish_session_with_retries(self):
+    def establish_session_with_retries(self, url=None):
         for attempt in range(1, self.config.max_session_attempts + 1):
             try:
-                if self.establish_session():
+                if self.establish_session(url):
                     return
                 logger.error("Session set-up did not finish (verification?).")
             except SessionAbort:
@@ -707,7 +841,6 @@ class Serff:
     # ---------------------------------------------------------
     # Search filters
     # ---------------------------------------------------------
-
     def _select_business_type(self):
         logger.info(f"FILTER: Selecting Business Type option[{self.config.business_type_index + 1}].")
         select_el = WebDriverWait(self.driver, self.config.element_timeout).until(
@@ -826,8 +959,8 @@ class Serff:
     def enter_dates(self):
         logger.info("STEP 6/7: Entering submission dates.")
         return (
-            self._enter_date(Locators.START_DATE, self.config.start_date, "Start date")
-            and self._enter_date(Locators.END_DATE, self.config.end_date, "End date")
+            self._enter_date(Locators.START_DATE, self.window.start_mmddyy, "Start date")
+            and self._enter_date(Locators.END_DATE, self.window.end_mmddyy, "End date")
         )
 
     def submit_search(self):
@@ -1153,7 +1286,6 @@ class Serff:
     # Downloads
     # ---------------------------------------------------------
     def _completed_downloads(self):
-        """Return completed files in self.config.download_dir (same filter as reference)."""
         folder = self.config.download_dir
         if not folder.is_dir():
             logger.warning(f"Download directory does not exist: {folder}")
@@ -1170,18 +1302,16 @@ class Serff:
         return files
 
     def _monitor_download(self, baseline, row_number):
-        """Watch the download folder; return early once a completed ZIP appears."""
         wait = self.config.download_wait
         started = time.monotonic()
         deadline = started + wait
         last_logged = -1
         saw_temp = False
-
         folder = self.config.download_dir
         folder.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"ROW {row_number}: Monitoring ZIP download (max {wait}s).")
-        logger.info(f"Download directory: {folder}")
+        logger.info(f"Staging directory: {folder}")
 
         while time.monotonic() < deadline:
             elapsed = int(time.monotonic() - started)
@@ -1197,7 +1327,7 @@ class Serff:
             if new_files and not in_progress:
                 for path in new_files:
                     logger.info(f"ROW {row_number}: New completed download: {path}")
-                return True
+                return set(new_files)
 
             if elapsed % 5 == 0 and elapsed != last_logged:
                 logger.info(
@@ -1217,45 +1347,72 @@ class Serff:
         else:
             for path in new_files:
                 logger.info(f"ROW {row_number}: New completed download: {path}")
-        return bool(new_files)
+        return set(new_files)
 
-    def _save_filing_html(self, data_rk, row_number):
+    def _move_zip_into_filing_folder(self, zip_paths, code, data_rk, row_number):
+        if not zip_paths:
+            return None
+        source = max(zip_paths, key=lambda p: Path(p).stat().st_size)
+        target = self.config.filing_zip_path(code, data_rk)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            logger.warning(f"ROW {row_number}: Overwriting existing ZIP: {target}")
+            target.unlink()
+        shutil.move(str(source), str(target))
+        logger.info(f"ROW {row_number}: ZIP moved -> {target}")
+        for extra in zip_paths:
+            if Path(extra).exists():
+                try:
+                    Path(extra).unlink()
+                except OSError:
+                    pass
+        return target
+
+    def _save_filing_html(self, code, data_rk, row_number):
         try:
-            safe_rk = re.sub(r"[^A-Za-z0-9_-]+", "_", str(data_rk or "unknown"))
-            name = f"filing_page_row_{row_number}_data-rk_{safe_rk}"
-            save_html(self.driver.page_source, name)
+            target = self.config.filing_html_path(code, data_rk)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            html = self.driver.page_source
+            target.write_text(html, encoding="utf-8")
+            logger.info(f"ROW {row_number}: Saved HTML -> {target}")
+            return target
         except Exception:
             logger.exception(f"ROW {row_number}: Failed to save filing page HTML.")
             self._screenshot(f"html_save_error_row_{row_number}")
+            return None
 
-    def _download_once(self, data_rk, row_number):
+    def _download_once(self, data_rk, code, row_number):
         url = self.config.filing_url(data_rk)
         logger.info(f"ROW {row_number}: Opening filing {data_rk}: {url}")
+
+        self.config.filing_dir(code, data_rk).mkdir(parents=True, exist_ok=True)
 
         self._load_page(url)
         self._wait_with_refresh(Locators.DOWNLOAD_ZIP, "Download Zip File button", condition="presence")
         time.sleep(2)
         self._log_page_info()
 
-        self._save_filing_html(data_rk, row_number)
+        self._save_filing_html(code, data_rk, row_number)
 
         baseline = self._completed_downloads()
         original_handles = set(self.driver.window_handles)
 
         self._click(Locators.DOWNLOAD_ZIP, "Download Zip File button")
-
-        # ZIP endpoint opens a new tab. Leave it open — closing it can cancel
-        # the download if Chrome still has an in-flight Save dialog on that tab.
         time.sleep(2)
         self._dismiss_blocking_dialogs(timeout=2)
 
-        confirmed = self._monitor_download(baseline, row_number)
+        new_files = self._monitor_download(baseline, row_number)
 
-        # Safe to clean up now — the file is on disk.
-        self._close_extra_windows(original_handles)
-        self._dismiss_blocking_dialogs(timeout=2)
-
-        return confirmed
+        try:
+            if not new_files:
+                raise RuntimeError(
+                    f"ZIP download not detected within {self.config.download_wait}s"
+                )
+            self._move_zip_into_filing_folder(new_files, code, data_rk, row_number)
+            return True
+        finally:
+            self._close_extra_windows(original_handles)
+            self._dismiss_blocking_dialogs(timeout=2)
 
     def _recover_page(self, problem, attempt):
         if problem == "captcha" and attempt == 1 and self.handle_verification():
@@ -1271,18 +1428,18 @@ class Serff:
             return "restarted"
         return "refreshed"
 
-    def _download_with_recovery(self, data_rk):
+    def _download_with_recovery(self, data_rk, code, website):
         row_number = self.store.completed_count + 1
         max_tries = self.config.max_row_retries
         reason = "unknown"
 
         for attempt in range(1, max_tries + 1):
             logger.info("=" * 70)
-            logger.info(f"ROW {row_number} | data-rk={data_rk} | attempt {attempt}/{max_tries}")
+            logger.info(f"ROW {row_number} | data-rk={data_rk} | code={code} | attempt {attempt}/{max_tries}")
             logger.info(f"ROW DATA: {self.store.records.get(data_rk, {}).get('row_text', '')}")
             try:
-                confirmed = self._download_once(data_rk, row_number)
-                self.store.mark_completed(data_rk, confirmed=confirmed)
+                self._download_once(data_rk, code, row_number)
+                self.store.mark_completed(data_rk, confirmed=True)
                 self._restarts = 0
                 logger.info(f"ROW COMPLETE. Total completed overall: {self.store.completed_count}")
                 return True
@@ -1300,18 +1457,47 @@ class Serff:
 
         logger.error(f"Row data-rk={data_rk} failed {max_tries} times; marked failed, moving on.")
         self.store.mark_failed(data_rk, reason)
+        self._cleanup_filing_folder(code, data_rk)
+        self._failed_rows.append({
+            "data_rk": data_rk,
+            "website": website or "",
+            "code": code or "",
+            "file_url": self.config.filing_url(data_rk),
+            "reason": reason,
+        })
         return False
 
-    def download_filings(self):
+    def _cleanup_filing_folder(self, code, data_rk):
+        """Remove <today>/<Code>/<id>/ if no ZIP lives there."""
+        folder = self.config.filing_dir(code, data_rk)
+        if not folder.is_dir():
+            return
+        has_zip = any(p.suffix.lower() == ".zip" for p in folder.iterdir())
+        if has_zip:
+            return
+        try:
+            shutil.rmtree(folder)
+            logger.info(f"Removed failed filing folder: {folder}")
+        except OSError:
+            logger.exception(f"Could not remove {folder}")
+
+    def download_filings(self, df=None, index=None):
         pending = self.store.pending_keys()
         logger.info("=" * 70)
         logger.info(f"DOWNLOAD PHASE: {len(pending)} pending of {len(self.store.records)} filing id(s).")
         logger.info("=" * 70)
 
+        code = ""
+        website = ""
+        if df is not None and index is not None:
+            input_row = df.loc[index]
+            code = str(input_row.get("Code", "") or "").strip()
+            website = str(input_row.get("Website", "") or "").strip()
+
         failed = []
         for position, data_rk in enumerate(pending, start=1):
             logger.info(f"DOWNLOAD {position}/{len(pending)}")
-            if not self._download_with_recovery(data_rk):
+            if not self._download_with_recovery(data_rk, code=code, website=website):
                 failed.append(data_rk)
 
         logger.info("=" * 70)
@@ -1320,54 +1506,155 @@ class Serff:
         if failed:
             logger.warning(f"Failed ids (retried automatically on the next run): {failed}")
         logger.info("=" * 70)
+
+        self._write_not_downloaded_xlsx()
         return not failed
+
+    def _write_not_downloaded_xlsx(self):
+        """Write <base_dir>/Not down.xlsx with Website / File Url / ID columns."""
+        target = self.config.base_dir / self.config.not_downloaded_xlsx
+        columns = ["Website", "File Url", "ID"]
+
+        if not self._failed_rows:
+            if not target.exists():
+                pd.DataFrame(columns=columns).to_excel(target, index=False)
+                logger.info(f"Wrote empty failure workbook -> {target}")
+            return
+
+        rows = []
+        for item in self._failed_rows:
+            rows.append({
+                "Website": item.get("website", ""),
+                "File Url": item.get("file_url", ""),
+                "Code": item.get("code", ""),
+                "ID": item.get("data_rk", ""),
+                "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        pd.DataFrame(rows).to_excel(target, index=False)
+        logger.info(f"Failure workbook written: {target} ({len(rows)} row(s))")
+
+    # ---------------------------------------------------------
+    # Excel helpers (Last Comp Date / File Path; date-window rollover)
+    # ---------------------------------------------------------
+    def _ensure_excel_columns(self, df):
+        if "Last Comp Date" not in df.columns:
+            df["Last Comp Date"] = ""
+        if "File Path" not in df.columns:
+            df["File Path"] = ""
+        return df
+
+    def _all_rows_completed(self, df):
+        if df is None or df.empty:
+            return False
+        return df["Status"].astype(str).str.strip().str.lower().eq("completed").all()
+
+    def _roll_window_and_mark_complete(self, df):
+        old = self.window.as_dict()
+        new_start, new_end = self.window.roll_back_to_previous_month()
+
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        for idx in df.index:
+            code = str(df.at[idx, "Code"] or "").strip()
+            df.at[idx, "Last Comp Date"] = today_iso
+            df.at[idx, "File Path"] = str(self.config.code_dir(code))
+
+        logger.info(
+            f"ALL ROWS COMPLETED. Date window rolled back: "
+            f"{old['start_date']}..{old['end_date']} -> "
+            f"{new_start.isoformat()}..{new_end.isoformat()}"
+        )
+
+    def _reset_progress_for_new_window(self):
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for path in (self.config.table_data_json, self.config.progress_json):
+            if path.is_file():
+                path.rename(path.with_name(f"{path.name}.done-{stamp}"))
+                logger.info(f"Archived {path.name} -> done-{stamp}")
 
     # ---------------------------------------------------------
     # Main entry
     # ---------------------------------------------------------
     def run(self):
+        df = None
+
         try:
             logger.info("=" * 70)
             logger.info("SERFF AUTOMATION STARTED")
+            logger.info(f"Date window: {self.window.as_dict()}")
             logger.info("=" * 70)
 
-            self.establish_session_with_retries()
+            df = pd.read_excel(self.config.input_csv)
+            df.columns = [str(c).strip() for c in df.columns]
+            df = self._ensure_excel_columns(df)
 
-            if self.store.collection_complete:
-                logger.info(
-                    f"Ids already collected ({len(self.store.records)}); "
-                    f"{len(self.store.pending_keys())} still to download. "
-                    "Skipping filters and search."
-                )
-            else:
-                logger.info(
-                    f"PHASE 1: collecting ids (pages already saved: {self.store.pages_collected})."
-                )
-                if not self.collect_ids():
-                    logger.warning("Collection stopped early; run again to resume.")
-                    return False
+            for index, row in df.iterrows():
+                status = str(row.get("Status", "") or "").strip().lower()
+                if status == "completed":
+                    logger.info(f"Skipping row {index + 1} (already completed).")
+                    continue
 
-            logger.info("PHASE 2: downloading filings.")
-            completed = self.download_filings()
-            if completed:
-                logger.info("All filings processed.")
-            else:
-                logger.warning("Some filings failed; run again to retry them.")
-            return completed
+                url = row["Website"]
+                self.establish_session_with_retries(url)
+
+                if self.store.collection_complete:
+                    logger.info(
+                        f"Ids already collected ({len(self.store.records)}); "
+                        f"{len(self.store.pending_keys())} still to download. "
+                        "Skipping filters and search."
+                    )
+                else:
+                    logger.info(
+                        f"PHASE 1: collecting ids "
+                        f"(pages already saved: {self.store.pages_collected})."
+                    )
+                    if not self.collect_ids():
+                        logger.warning("Collection stopped early; run again to resume.")
+                        return False
+
+                logger.info("PHASE 2: downloading filings.")
+                completed = self.download_filings(df=df, index=index)
+
+                if completed:
+                    logger.info("All filings processed.")
+                else:
+                    logger.warning("Some filings failed; run again to retry them.")
+
+                df.at[index, "Status"] = "Completed" if completed else "Partial"
+
+            if self._all_rows_completed(df):
+                self._roll_window_and_mark_complete(df)
+                self._reset_progress_for_new_window()
 
         except KeyboardInterrupt:
             logger.warning("Automation interrupted by the user.")
+
         except SessionAbort as exc:
             logger.error(f"Stopping: {exc} State is saved; run again to resume.")
             self._screenshot("session_abort")
+
         except UnexpectedAlertPresentException:
             logger.exception("Unexpected JavaScript alert interrupted automation.")
             self._screenshot("unexpected_alert")
+
         except Exception:
             logger.exception("Automation failed.")
             self._screenshot("automation_failure")
+
         finally:
             self.close()
+
+            try:
+                self._write_not_downloaded_xlsx()
+            except Exception:
+                logger.exception("Could not write Not down.xlsx")
+
+            if df is not None:
+                try:
+                    df.to_excel(self.config.input_csv, index=False, encoding="latin-1")
+                except Exception:
+                    logger.exception("Could not save input Excel.")
+
         return False
 
 
@@ -1376,4 +1663,9 @@ class Serff:
 # =============================================================
 
 if __name__ == "__main__":
-    Serff().run()
+    try:
+        Serff().run()
+    except DateWindowError as exc:
+        logger.error(f"Cannot start: {exc}")
+        # Re-raise so the process exits with a non-zero status.
+        raise
