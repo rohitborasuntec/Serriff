@@ -91,6 +91,24 @@ if exist "%OLD_FOLDER%" (
     ) else (
         echo "date.json" not found. Skipping.
     )
+
+    REM Move all "serff_progress" files (handles the changing timestamp names)
+    if exist "%OLD_FOLDER%\serff_progress*" (
+        echo Moving "serff_progress" files...
+        move "%OLD_FOLDER%\serff_progress*" "%NEW_FOLDER%\" >nul
+        if errorlevel 1 echo WARNING: Could not move "serff_progress" files
+    ) else (
+        echo "serff_progress" files not found. Skipping.
+    )
+
+    REM Move all "serff_table_data" files (handles the changing timestamp names)
+    if exist "%OLD_FOLDER%\serff_table_data*" (
+        echo Moving "serff_table_data" files...
+        move "%OLD_FOLDER%\serff_table_data*" "%NEW_FOLDER%\" >nul
+        if errorlevel 1 echo WARNING: Could not move "serff_table_data" files
+    ) else (
+        echo "serff_table_data" files not found. Skipping.
+    )
     
     REM Step 4: Delete the old folder
     echo.
@@ -110,5 +128,6 @@ echo.
 echo ========================================
 echo Process completed!
 echo ========================================
+pause
 endlocal
 exit /b 1
