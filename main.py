@@ -212,7 +212,7 @@ class SerffConfig:
 
     not_downloaded_xlsx: str = "Not down.xlsx"
     input_csv = "Urls.xlsx"
-    window_json = "serff_window.json"
+    window_json = "date.json"
 
     # ---------- derived paths ----------
     @property
@@ -239,14 +239,15 @@ class SerffConfig:
         return self.today_dir / safe
 
     def filing_dir(self, code, data_rk) -> Path:
-        return self.code_dir(code) / str(data_rk)
+        # Flat layout: the filing lives directly under the Code folder.
+        return self.code_dir(code)
 
     def filing_zip_path(self, code, data_rk) -> Path:
         return self.filing_dir(code, data_rk) / f"{data_rk}.zip"
 
     def filing_html_path(self, code, data_rk) -> Path:
         return self.filing_dir(code, data_rk) / f"{data_rk}.html"
-
+    
     def criteria(self, start_date: str, end_date: str):
         """Identifies the search; saved JSON from a different search is archived."""
         return {
@@ -1468,18 +1469,29 @@ class Serff:
         return False
 
     def _cleanup_filing_folder(self, code, data_rk):
-        """Remove <today>/<Code>/<id>/ if no ZIP lives there."""
+        """
+        Failed filing cleanup (flat layout: <today>/<Code>/<id>.zip + <id>.html).
+
+        - Keep <id>.html: it is the only record of what the filing page looked
+          like when the download failed, so it is retained for debugging/retry.
+        - Remove <id>.zip if a partial/empty one was written, so the next run
+          does not mistake it for a completed download.
+        """
         folder = self.config.filing_dir(code, data_rk)
         if not folder.is_dir():
             return
-        has_zip = any(p.suffix.lower() == ".zip" for p in folder.iterdir())
-        if has_zip:
-            return
-        try:
-            shutil.rmtree(folder)
-            logger.info(f"Removed failed filing folder: {folder}")
-        except OSError:
-            logger.exception(f"Could not remove {folder}")
+
+        zip_path = self.config.filing_zip_path(code, data_rk)
+        if zip_path.is_file():
+            try:
+                zip_path.unlink()
+                logger.info(f"Removed failed filing ZIP (HTML kept): {zip_path}")
+            except OSError:
+                logger.exception(f"Could not remove {zip_path}")
+
+        html_path = self.config.filing_html_path(code, data_rk)
+        if html_path.is_file():
+            logger.info(f"Kept filing HTML for debugging: {html_path}")
 
     def download_filings(self, df=None, index=None):
         pending = self.store.pending_keys()
