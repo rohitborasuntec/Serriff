@@ -20,26 +20,33 @@ both files named after the SERFF Tracking Number shown on the filing page:
     Output Data/{YYYY-MM-DD}/{Code}/{trackingId}.zip
     Output Data/{YYYY-MM-DD}/{Code}/{trackingId}.html
 
-Skipped (terminal) filings:
-    A filing whose page has no "Download Zip File" button, or whose SERFF
-    Tracking Number cannot be read, is recorded under
-    serff_progress.json -> skipped_data_rk. It is excluded from pending_keys()
-    on every subsequent run (never retried) and appears in Not down.xlsx.
-    To force a re-check, delete its key from skipped_data_rk (or call
-    ProgressStore.clear_skipped(data_rk)).
+Not-down persistence:
+    not_down.json (JSON) is the source of truth.  It is appended to on every
+    skipped/failed row, MERGED with any existing file so re-runs never lose
+    history.  "Not down.xlsx" is DERIVED from it — written at the end of every
+    run (best-effort), or on demand via:
 
-Failed (retryable) filings:
-    Page errors, button-click errors, or ZIP never arriving after retries.
-    They are recorded under serff_progress.json -> failed and retried on the
-    next run. They also appear in Not down.xlsx for that run.
+        python3 -m src.automation.not_down_to_xlsx
+
+    Columns of Not down.xlsx:
+        Website | File Url | Code | ID | Tracking Number | Reason | Status | Date
+
+    status = "skipped"  -> terminal (no ZIP on page); never retried.
+    status = "failed"   -> retryable; will be retried on the next run.
+
+Progress state (serff_progress.json):
+    completed_data_rk : successfully downloaded (ZIP + HTML saved).
+    skipped_data_rk   : terminal no-ZIP rows; never re-opened.
+    failed            : retryable failures; retried on the next run.
+
+    To force a re-check of a skipped filing, delete its key from
+    serff_progress.json -> skipped_data_rk, and remove its entry from
+    not_down.json if you want it removed from the report.
 
 When every row in Urls.xlsx is Completed, the window rolls back one calendar
 month, serff_window.json is rewritten, and Urls.xlsx is stamped with:
     Last Comp Date   -> today's date
     File Path        -> Output Data/{today}/{Code}/
-
-Not down.xlsx columns:
-    Website | File Url | Code | ID | Tracking Number | Reason | Date
 
 Run:
     python3 -m src.automation.serff
@@ -85,8 +92,8 @@ class DateWindowError(Exception):
 class ZipNotAvailable(Exception):
     """The filing page loaded but no Download ZIP button / ZIP is available.
 
-    This is terminal for the row — we record it in `Not down.xlsx` and in
-    `serff_progress.json -> skipped_data_rk`, and never retry it.
+    This is terminal for the row — recorded in `not_down.json` (status=skipped),
+    in `serff_progress.json -> skipped_data_rk`, and never retried.
     """
 
 
@@ -246,6 +253,8 @@ class SerffConfig:
         default_factory=lambda: Path(__file__).resolve().parent / "Output Data"
     )
 
+    # not_down.json is the source of truth; Not down.xlsx is derived from it.
+    not_downloaded_json: str = "not_down.json"
     not_downloaded_xlsx: str = "Not down.xlsx"
     input_csv = "Urls.xlsx"
     window_json = "date.json"
@@ -262,6 +271,14 @@ class SerffConfig:
     @property
     def window_json_path(self):
         return self.base_dir / self.window_json
+
+    @property
+    def not_downloaded_json_path(self) -> Path:
+        return self.base_dir / self.not_downloaded_json
+
+    @property
+    def not_downloaded_xlsx_path(self) -> Path:
+        return self.base_dir / self.not_downloaded_xlsx
 
     @property
     def today_dir(self) -> Path:
@@ -535,7 +552,7 @@ class ProgressStore:
         """Record a row as terminally skipped (e.g. no ZIP on the page).
 
         It is excluded from `pending_keys()` on every subsequent run and is
-        exported into `Not down.xlsx` for the operator.
+        included in `not_down.json` / `Not down.xlsx` for the operator.
         """
         bucket = self.progress.setdefault("skipped_data_rk", {})
         bucket[data_rk] = {
@@ -574,12 +591,6 @@ class Serff:
     # =========================================================
     # Type-of-Insurance ticker
     # =========================================================
-    #
-    # Rule: a checkbox value is TICKED iff:
-    #   * some prefix in `allow` starts it AND the next character is a digit
-    #     (so "A01..." matches; bare "Annuity" does not)
-    #   * UNLESS some prefix in `block` starts it AND the next character is a
-    #     digit (so "HOrg02G" is excluded even though "H" is in allow)
     _TICK_BY_PREFIX_JS = r"""
         var allow = arguments[0];
         var block = arguments[1];
@@ -685,7 +696,6 @@ class Serff:
         )
         self._restarts = 0
         self._collect_failures = 0
-        self._failed_rows = []
 
     # ---------------------------------------------------------
     # Driver lifecycle
@@ -1090,13 +1100,7 @@ class Serff:
         time.sleep(randint(1, 3))
 
     def _read_tracking_number(self, timeout=None):
-        """Read the SERFF Tracking Number shown on a filing page.
-
-        The value is displayed as a label-value pair:
-            <span>SERFF Tracking Number: </span> <span>AL-2024-00123</span>
-        The XPath matches the element *after* the label.  Waits for it to be
-        present and non-empty; returns the stripped string.
-        """
+        """Read the SERFF Tracking Number shown on a filing page."""
         timeout = timeout or self.config.element_timeout
         logger.info("Reading SERFF Tracking Number from filing page.")
         try:
@@ -1116,16 +1120,7 @@ class Serff:
 
     def _select_insurance_types(self):
         """Tick every Type-of-Insurance code whose prefix is in the allow-list
-        AND whose prefix is immediately followed by a digit.
-
-        Verification:
-        * PRIMARY: hidden inputs are the exact set the form will submit.
-        * OPTIONAL: if config.expected_tois_count is set, the DOM count must
-                    equal it, otherwise abort.
-        * ADVISORY: the page's 'N Types of Insurance selected' label — which
-                    is server-rendered and only refreshed by Search — is
-                    logged but never used to abort.
-        """
+        AND whose prefix is immediately followed by a digit."""
         allow = list(self.config.insurance_prefix_allowlist)
         block = list(self.config.insurance_prefix_blocklist)
 
@@ -1144,7 +1139,6 @@ class Serff:
         have   = result["checkedNow"]
         label  = result["pageLabel"]
 
-        # ---- OPTIONAL count gate (off by default) ----------------------------
         if (self.config.expected_tois_count is not None
                 and want != self.config.expected_tois_count):
             self._screenshot("tois_count_mismatch")
@@ -1156,7 +1150,6 @@ class Serff:
                 f"{result.get('skipped', [])}"
             )
 
-        # ---- PRIMARY: the DOM state must match exactly -----------------------
         if have != want:
             time.sleep(1)
             result = _state()
@@ -1170,7 +1163,6 @@ class Serff:
                     f"checked DOM = {have} (page label = {label})."
                 )
 
-        # ---- ADVISORY: page label --------------------------------------------
         if label is None:
             logger.info(f"FILTER: Confirmed {want} checkboxes ticked "
                         f"(page has no label element). ✅")
@@ -1540,6 +1532,78 @@ class Serff:
         return True
 
     # ---------------------------------------------------------
+    # Not-down persistence: JSON is the source of truth; XLSX is derived
+    # ---------------------------------------------------------
+    def _load_not_down_json(self) -> list:
+        """Return the current list of not-down entries (from disk, if any)."""
+        path = self.config.not_downloaded_json_path
+        if not path.is_file():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            logger.exception(f"Could not read {path}; starting a fresh list.")
+            return []
+
+    def _save_not_down_json(self, entries: list):
+        """Atomic write of the not-down JSON."""
+        path = self.config.not_downloaded_json_path
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh, indent=2, ensure_ascii=False)
+        tmp.replace(path)
+        logger.info(f"not_down.json updated: {path} ({len(entries)} entry(ies))")
+
+    def _append_not_down(self, entry: dict):
+        """Merge a new not-down entry into not_down.json by `id`.
+
+        Reads the existing file so re-runs accumulate rather than overwrite.
+        Later entries win on duplicates (a re-run can promote `failed` ->
+        `skipped`, or refresh a `recorded_at` timestamp).
+        """
+        entries = self._load_not_down_json()
+        by_id = {e.get("id"): e for e in entries if e.get("id")}
+        by_id[entry["id"]] = entry
+        merged = list(by_id.values())
+        self._save_not_down_json(merged)
+
+    def _export_not_down_xlsx(self):
+        """Convert not_down.json -> Not down.xlsx (best-effort).
+
+        Called at the end of every run (in `finally`) and by the standalone
+        `not_down_to_xlsx.py` script. Failure here never affects the run.
+        """
+        try:
+            entries = self._load_not_down_json()
+            target = self.config.not_downloaded_xlsx_path
+            columns = ["Website", "File Url", "Code", "ID",
+                       "Tracking Number", "Reason", "Status", "Date"]
+
+            if not entries:
+                if not target.exists():
+                    pd.DataFrame(columns=columns).to_excel(target, index=False)
+                    logger.info(f"Wrote empty Not down.xlsx -> {target}")
+                return
+
+            rows = [{
+                "Website": e.get("website", ""),
+                "File Url": e.get("file_url", ""),
+                "Code": e.get("code", ""),
+                "ID": e.get("id", ""),
+                "Tracking Number": e.get("tracking_number", ""),
+                "Reason": e.get("reason", ""),
+                "Status": e.get("status", ""),
+                "Date": e.get("recorded_at", ""),
+            } for e in entries]
+
+            pd.DataFrame(rows, columns=columns).to_excel(target, index=False)
+            logger.info(f"Not down.xlsx written: {target} ({len(rows)} row(s))")
+        except Exception:
+            logger.exception("Could not export Not down.xlsx from not_down.json.")
+
+    # ---------------------------------------------------------
     # Downloads
     # ---------------------------------------------------------
     def _completed_downloads(self):
@@ -1644,8 +1708,6 @@ class Serff:
 
         self._load_page(url)
 
-        # The tracking number is needed to name the files; if we can't read
-        # it we still record the row as skipped and move on.
         try:
             tracking_num = self._read_tracking_number()
         except RuntimeError:
@@ -1659,40 +1721,31 @@ class Serff:
         if record is not None:
             record["tracking_number"] = tracking_num
 
-        # Make sure the Code folder exists (flat layout).
         self.config.code_dir(code).mkdir(parents=True, exist_ok=True)
-
-        # Save the HTML now — it's our proof-of-state for Not down.xlsx.
         self._save_filing_html(code, tracking_num, row_number)
 
-        # Check the Download ZIP button actually exists (no raise, just wait).
-        try:
-            WebDriverWait(self.driver, self.config.element_timeout).until(
-                EC.presence_of_element_located(Locators.DOWNLOAD_ZIP)
-            )
-        except TimeoutException:
+        if not self.driver.find_elements(*Locators.DOWNLOAD_ZIP):
             logger.warning(
                 f"ROW {row_number}: No Download Zip File button on the filing "
                 f"page — recording as skipped."
             )
             self._screenshot(f"no_download_button_row_{row_number}")
             raise ZipNotAvailable("Download ZIP button not present on page")
-
-        time.sleep(2)
+        
+        time.sleep(random.uniform(1,2))
         self._log_page_info()
 
         baseline = self._completed_downloads()
         original_handles = set(self.driver.window_handles)
 
         self._click(Locators.DOWNLOAD_ZIP, "Download Zip File button")
-        time.sleep(2)
+        time.sleep(random.uniform(0.5,2))
         self._dismiss_blocking_dialogs(timeout=2)
 
         new_files = self._monitor_download(baseline, row_number)
 
         try:
             if not new_files:
-                # Button existed but no file appeared — retryable.
                 raise RuntimeError(
                     f"ZIP download not detected within {self.config.download_wait}s"
                 )
@@ -1737,8 +1790,6 @@ class Serff:
             except (KeyboardInterrupt, SessionAbort):
                 raise
             except ZipNotAvailable as exc:
-                # Terminal — no ZIP available; do not retry, do not resurrect
-                # on subsequent runs.
                 reason = f"ZipNotAvailable: {exc}".strip()[:300]
                 logger.warning(
                     f"Row data-rk={data_rk} has no downloadable ZIP "
@@ -1747,13 +1798,16 @@ class Serff:
                 self._screenshot(f"row_{data_rk}_no_zip")
                 self._cleanup_filing_folder(code, data_rk)
                 self.store.mark_skipped(data_rk, reason)
-                self._failed_rows.append({
-                    "data_rk": data_rk,
+
+                self._append_not_down({
+                    "id": data_rk,
                     "website": website or "",
-                    "code": code or "",
-                    "tracking_num": (self.store.records.get(data_rk) or {}).get("tracking_number", ""),
                     "file_url": self.config.filing_url(data_rk),
+                    "code": code or "",
+                    "tracking_number": (self.store.records.get(data_rk) or {}).get("tracking_number", ""),
                     "reason": reason,
+                    "status": "skipped",
+                    "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 })
                 terminal = True
                 break
@@ -1774,13 +1828,16 @@ class Serff:
             )
             self.store.mark_failed(data_rk, reason)
             self._cleanup_filing_folder(code, data_rk)
-            self._failed_rows.append({
-                "data_rk": data_rk,
+
+            self._append_not_down({
+                "id": data_rk,
                 "website": website or "",
-                "code": code or "",
-                "tracking_num": (self.store.records.get(data_rk) or {}).get("tracking_number", ""),
                 "file_url": self.config.filing_url(data_rk),
+                "code": code or "",
+                "tracking_number": (self.store.records.get(data_rk) or {}).get("tracking_number", ""),
                 "reason": reason,
+                "status": "failed",
+                "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
         return False
 
@@ -1821,7 +1878,7 @@ class Serff:
         if skipped_count:
             logger.info(
                 f"Skipping {skipped_count} filing(s) previously marked as "
-                f"not-downloadable (see Not down.xlsx / serff_progress.json)."
+                f"not-downloadable (see not_down.json)."
             )
         logger.info("=" * 70)
 
@@ -1844,65 +1901,7 @@ class Serff:
         if failed:
             logger.warning(f"Failed ids (retried automatically on the next run): {failed}")
         logger.info("=" * 70)
-
-        self._write_not_downloaded_xlsx()
         return not failed
-
-    def _write_not_downloaded_xlsx(self):
-        """Write <base_dir>/Not down.xlsx.
-
-        Includes:
-          * rows that failed in THIS run (`self._failed_rows`), and
-          * every row persisted in `serff_progress.json -> skipped_data_rk`
-            (terminal no-ZIP rows from any previous run).
-
-        Columns: Website | File Url | Code | ID | Tracking Number | Reason | Date
-        """
-        target = self.config.base_dir / self.config.not_downloaded_xlsx
-        columns = ["Website", "File Url", "Code", "ID",
-                   "Tracking Number", "Reason", "Date"]
-
-        rows = []
-        seen = set()
-
-        # 1) this-run failures (transient or terminal)
-        for item in self._failed_rows:
-            rk = item.get("data_rk", "")
-            seen.add(rk)
-            rows.append({
-                "Website": item.get("website", ""),
-                "File Url": item.get("file_url", ""),
-                "Code": item.get("code", ""),
-                "ID": rk,
-                "Tracking Number": item.get("tracking_num", ""),
-                "Reason": item.get("reason", ""),
-                "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
-
-        # 2) persisted skipped (terminal) rows — survives across runs
-        skipped = self.store.progress.get("skipped_data_rk") or {}
-        for rk, meta in skipped.items():
-            if rk in seen:
-                continue
-            record = self.store.records.get(rk, {}) or {}
-            rows.append({
-                "Website": "",
-                "File Url": self.config.filing_url(rk),
-                "Code": "",
-                "ID": rk,
-                "Tracking Number": record.get("tracking_number", ""),
-                "Reason": meta.get("reason", ""),
-                "Date": meta.get("at", ""),
-            })
-
-        if not rows:
-            if not target.exists():
-                pd.DataFrame(columns=columns).to_excel(target, index=False)
-                logger.info(f"Wrote empty failure workbook -> {target}")
-            return
-
-        pd.DataFrame(rows, columns=columns).to_excel(target, index=False)
-        logger.info(f"Failure workbook written: {target} ({len(rows)} row(s))")
 
     # ---------------------------------------------------------
     # Excel helpers (Last Comp Date / File Path; date-window rollover)
@@ -2015,9 +2014,9 @@ class Serff:
             self.close()
 
             try:
-                self._write_not_downloaded_xlsx()
+                self._export_not_down_xlsx()
             except Exception:
-                logger.exception("Could not write Not down.xlsx")
+                logger.exception("Could not export Not down.xlsx from not_down.json")
 
             if df is not None:
                 try:

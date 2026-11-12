@@ -17,7 +17,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def solve_capctha(driver):
-    api_key = api_key or os.environ.get('APIKEY_2CAPTCHA')
+
+    if driver.find_elements(By.XPATH,'//button[@id="amzn-captcha-verify-button"]'):
+        driver.find_element(By.XPATH,'//button[@id="amzn-captcha-verify-button"]').click()
+
+    api_key = os.environ.get('APIKEY_2CAPTCHA')
     if not api_key:
         raise ValueError(
             "2Captcha API key missing. Pass api_key= or set "
@@ -139,17 +143,15 @@ def is_verification_page(driver):
 
     # try:
     title = driver.title.lower()
-    url = driver.current_url.lower()
+    # url = driver.current_url.lower()
     source = driver.page_source.lower()
-
+    
     return (
         "human verification" in title
         or (
-            "useragreement.xhtml" in url
-            and (
                 "let's confirm you are human" in source
                 or "complete the security check" in source
-            )
+            
         )
     )
 
