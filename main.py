@@ -21,32 +21,19 @@ both files named after the SERFF Tracking Number shown on the filing page:
     Output Data/{YYYY-MM-DD}/{Code}/{trackingId}.html
 
 Not-down persistence:
-    not_down.json (JSON) is the source of truth.  It is appended to on every
-    skipped/failed row, MERGED with any existing file so re-runs never lose
-    history.  "Not down.xlsx" is DERIVED from it — written at the end of every
-    run (best-effort), or on demand via:
-
-        python3 -m src.automation.not_down_to_xlsx
-
-    Columns of Not down.xlsx:
-        Website | File Url | Code | ID | Tracking Number | Reason | Status | Date
-
-    status = "skipped"  -> terminal (no ZIP on page); never retried.
-    status = "failed"   -> retryable; will be retried on the next run.
+    not_down.json is the source of truth; Not down.xlsx is derived from it at
+    the end of every run (or via `python3 -m src.automation.not_down_to_xlsx`).
 
 Progress state (serff_progress.json):
     completed_data_rk : successfully downloaded (ZIP + HTML saved).
     skipped_data_rk   : terminal no-ZIP rows; never re-opened.
     failed            : retryable failures; retried on the next run.
 
-    To force a re-check of a skipped filing, delete its key from
-    serff_progress.json -> skipped_data_rk, and remove its entry from
-    not_down.json if you want it removed from the report.
-
-When every row in Urls.xlsx is Completed, the window rolls back one calendar
-month, serff_window.json is rewritten, and Urls.xlsx is stamped with:
-    Last Comp Date   -> today's date
-    File Path        -> Output Data/{today}/{Code}/
+Session expiry:
+    When a filing page shows a "session expired" interstitial, the browser is
+    restarted, BEGIN SEARCH / ACCEPT are re-run from `site_home_url`, and then
+    the browser navigates DIRECTLY to the filing URL we were on — no filters,
+    no search — and the row is retried.
 
 Run:
     python3 -m src.automation.serff
@@ -92,8 +79,17 @@ class DateWindowError(Exception):
 class ZipNotAvailable(Exception):
     """The filing page loaded but no Download ZIP button / ZIP is available.
 
-    This is terminal for the row — recorded in `not_down.json` (status=skipped),
-    in `serff_progress.json -> skipped_data_rk`, and never retried.
+    Terminal for the row — recorded in `not_down.json` (status=skipped),
+    `serff_progress.json -> skipped_data_rk`, and never retried.
+    """
+
+
+class SessionExpiredRetry(Exception):
+    """Session-expired interstitial hit mid-download.
+
+    Re-establish the session (BEGIN SEARCH -> ACCEPT), then navigate straight
+    back to the filing URL we were on and retry the row.  Skipping search and
+    filters is safe — filing pages are directly addressable via filingId.
     """
 
 
@@ -105,17 +101,12 @@ class DateWindow:
     """
     Loads / persists serff_window.json:
         {"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}
-
-    The SERFF UI expects MM/DD/YY, so we expose .start_mmddyy / .end_mmddyy
-    for the search form. If the file is missing or invalid, the constructor
-    raises DateWindowError — there are no default dates.
     """
 
     def __init__(self, path):
         self.path = Path(path)
         self.start, self.end = self._load_required()
 
-    # ---------- disk I/O ----------
     def _load_required(self):
         if not self.path.is_file():
             raise DateWindowError(
@@ -141,16 +132,12 @@ class DateWindow:
         return start, end
 
     def _save(self, start: date, end: date):
-        payload = {
-            "start_date": start.isoformat(),
-            "end_date": end.isoformat(),
-        }
+        payload = {"start_date": start.isoformat(), "end_date": end.isoformat()}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self.path)
         logger.info(f"Date window saved: {self.path} -> {payload}")
 
-    # ---------- mutation ----------
     def set(self, start: date, end: date):
         if start > end:
             raise DateWindowError(f"Refusing to save inverted window: {start} > {end}")
@@ -172,7 +159,6 @@ class DateWindow:
         last_day = (next_month - pd.Timedelta(days=1)).day
         return date(year, month, min(d.day, last_day))
 
-    # ---------- display formats ----------
     @property
     def start_mmddyy(self) -> str:
         return self.start.strftime("%m/%d/%y")
@@ -195,21 +181,17 @@ class SerffConfig:
 
     state: str = "AL"
 
-    # Timeouts (seconds)
     element_timeout: int = 30
     page_load_timeout: int = 60
     search_result_timeout: int = 60
     verification_timeout: int = 300
 
-    # Verification
     max_captcha_attempts: int = 3
     post_solve_wait: int = 3
 
-    # Download monitoring
     download_wait: int = 20
     rows_per_page: str = "100"
 
-    # Retry / recovery
     max_refreshes: int = 3
     refresh_backoff: int = 3
     max_row_retries: int = 3
@@ -226,40 +208,32 @@ class SerffConfig:
     business_type_index: int = 2
 
     # Search filters — Type of Insurance
-    # A checkbox value is TICKED iff it starts with one of the allow-list
-    # prefixes AND the next character is a digit (so 'A01…' matches but the
-    # bare label 'Annuity' does not).  Block-list wins over allow-list, so
-    # 'HOrg*' is excluded even though it starts with 'H'.
     insurance_prefix_allowlist: tuple = ("A", "CR", "H", "L", "LTC", "MS")
     insurance_prefix_blocklist: tuple = ("HOrg",)
 
-    # Optional safety check: if set, the ticked count must equal this number
-    # or the run aborts.  Leave None to derive the set purely from the rules.
     expected_tois_count: int | None = None
 
-    # Direct filing URL. data-rk of a row == filingId.
+    # Base SERFF site — used when re-establishing a session after a
+    # session-expiry interstitial (BEGIN SEARCH lives here).
+    site_home_url: str = "https://serff-sfa.naic.org/serff/sfa/"
+
     filing_url_template: str = (
         "https://serff-sfa.naic.org/serff/sfa/search/filingSummary.xhtml?filingId={id}"
     )
 
-    # Paths
     base_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent)
-
     download_dir: Path = field(
         default_factory=lambda: Path(__file__).resolve().parent / "Downloads"
     )
-
     output_root: Path = field(
         default_factory=lambda: Path(__file__).resolve().parent / "Output Data"
     )
 
-    # not_down.json is the source of truth; Not down.xlsx is derived from it.
     not_downloaded_json: str = "not_down.json"
     not_downloaded_xlsx: str = "Not down.xlsx"
     input_csv = "Urls.xlsx"
     window_json = "date.json"
 
-    # ---------- derived paths ----------
     @property
     def progress_json(self):
         return self.base_dir / "serff_progress.json"
@@ -294,7 +268,6 @@ class SerffConfig:
         return self.today_dir / self._safe(code, "unknown")
 
     def filing_dir(self, code) -> Path:
-        # Flat layout: the filing artifacts live directly under the Code folder.
         return self.code_dir(code)
 
     def filing_zip_path(self, code, tracking_num) -> Path:
@@ -306,7 +279,6 @@ class SerffConfig:
         return self.filing_dir(code) / f"{name}.html"
 
     def criteria(self, start_date: str, end_date: str):
-        """Identifies the search; saved JSON from a different search is archived."""
         return {
             "state": self.state,
             "start_date": start_date,
@@ -384,12 +356,6 @@ class Locators:
 
 class ProgressStore:
     """
-    Two JSON files:
-      table_data  {"meta": {...}, "records": {data_rk: {...}}}   <- phase 1 output
-      progress    {"completed_data_rk": [...],
-                   "skipped_data_rk": {data_rk: {reason, at}},
-                   "failed": {data_rk: {...}}}                   <- phase 2 checkpoint
-
     - completed_data_rk : successfully downloaded (ZIP + HTML saved)
     - skipped_data_rk   : terminal "no ZIP" rows; NEVER retried
     - failed            : retryable failures; retried on next run
@@ -402,7 +368,6 @@ class ProgressStore:
         self.progress = self._load_progress()
         self.table = self._load_table()
 
-    # ---------- generic ----------
     @staticmethod
     def _save_json_atomic(path, payload):
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -426,7 +391,6 @@ class ProgressStore:
     def _now():
         return datetime.now().isoformat(timespec="seconds")
 
-    # ---------- loading ----------
     @staticmethod
     def _new_progress():
         return {
@@ -473,7 +437,6 @@ class ProgressStore:
         data.setdefault("records", {})
         return data
 
-    # ---------- phase 1: collection ----------
     @property
     def meta(self):
         return self.table["meta"]
@@ -505,7 +468,6 @@ class ProgressStore:
         self.meta["updated_at"] = self._now()
         self._save_json_atomic(self.table_path, self.table)
 
-    # ---------- phase 2: downloads ----------
     @property
     def completed_keys(self):
         return set(self.progress["completed_data_rk"])
@@ -544,21 +506,12 @@ class ProgressStore:
         self.progress["updated_at"] = self._now()
         self._save_json_atomic(self.progress_path, self.progress)
 
-    # ---------- phase 2: skipped (terminal, not retryable) ----------
     def is_skipped(self, data_rk):
         return data_rk in (self.progress.get("skipped_data_rk") or {})
 
     def mark_skipped(self, data_rk, reason):
-        """Record a row as terminally skipped (e.g. no ZIP on the page).
-
-        It is excluded from `pending_keys()` on every subsequent run and is
-        included in `not_down.json` / `Not down.xlsx` for the operator.
-        """
         bucket = self.progress.setdefault("skipped_data_rk", {})
-        bucket[data_rk] = {
-            "reason": str(reason)[:300],
-            "at": self._now(),
-        }
+        bucket[data_rk] = {"reason": str(reason)[:300], "at": self._now()}
         self.progress["failed"].pop(data_rk, None)
         self.progress["updated_at"] = self._now()
         self._save_json_atomic(self.progress_path, self.progress)
@@ -588,9 +541,6 @@ class Serff:
     }
     HARD_PROBLEMS = {"session_expired", "blocked", "driver_dead"}
 
-    # =========================================================
-    # Type-of-Insurance ticker
-    # =========================================================
     _TICK_BY_PREFIX_JS = r"""
         var allow = arguments[0];
         var block = arguments[1];
@@ -696,6 +646,7 @@ class Serff:
         )
         self._restarts = 0
         self._collect_failures = 0
+        self._last_filing_url = None    # used by session-expiry recovery
 
     # ---------------------------------------------------------
     # Driver lifecycle
@@ -797,6 +748,24 @@ class Serff:
     # ---------------------------------------------------------
     # Problem detection + refresh helpers
     # ---------------------------------------------------------
+    def _is_session_expired_page(self):
+        """True if the current page is a SERFF 'session expired' interstitial."""
+        try:
+            url = (self.driver.current_url or "").lower()
+            if "expired" in url:
+                return True
+            html = (self.driver.page_source or "").lower()
+            markers = (
+                "session expired",
+                "session has expired",
+                "session timed out",
+                "view expired",
+                "viewexpired",
+            )
+            return any(m in html for m in markers)
+        except WebDriverException:
+            return False
+
     def _page_problem(self):
         if self.driver is None:
             return "driver_dead"
@@ -977,7 +946,10 @@ class Serff:
     # ---------------------------------------------------------
     def open_site(self, url=None):
         logger.info("STEP 2: Opening SERFF website.")
-        self._load_page(url)
+        if url:
+            self._load_page(url)
+        else:
+            logger.info("No URL supplied; assuming browser is on the SERFF site already.")
         self._log_page_info()
         return self.handle_verification()
 
@@ -1053,7 +1025,8 @@ class Serff:
             time.sleep(self.config.restart_cooldown * attempt)
         raise SessionAbort("Could not establish a SERFF session.")
 
-    def restart_session(self):
+    def restart_session(self, url=None):
+        """Full session restart. `url` is the initial URL to open (defaults to site_home_url)."""
         self._restarts += 1
         if self._restarts > self.config.max_consecutive_restarts:
             raise SessionAbort(
@@ -1062,7 +1035,34 @@ class Serff:
         logger.warning(f"RESTARTING SESSION ({self._restarts}/{self.config.max_consecutive_restarts}).")
         self.close()
         time.sleep(self.config.restart_cooldown * min(self._restarts, 3))
-        self.establish_session_with_retries()
+        self.establish_session_with_retries(url or self.config.site_home_url)
+
+    def restart_session_and_resume(self, target_url=None):
+        """Restart the browser, redo BEGIN SEARCH / ACCEPT, then navigate
+        DIRECTLY to `target_url` (the filing page we were on).
+
+        Skips filters and search — filing URLs are directly reachable while
+        the fresh session is valid.
+        """
+        self._restarts += 1
+        if self._restarts > self.config.max_consecutive_restarts:
+            raise SessionAbort(
+                f"{self.config.max_consecutive_restarts} session restarts in a row without progress."
+            )
+        logger.warning(
+            f"RESTARTING SESSION ({self._restarts}/{self.config.max_consecutive_restarts}) "
+            f"and resuming at {target_url or self.config.site_home_url}."
+        )
+        self.close()
+        time.sleep(self.config.restart_cooldown * min(self._restarts, 3))
+
+        # 1) Fresh session from the SERFF home page.
+        self.establish_session_with_retries(url=self.config.site_home_url)
+
+        # 2) Jump straight back to the filing URL we were on.
+        if target_url:
+            logger.info(f"RESUME: Navigating back to {target_url}")
+            self._load_page(target_url)
 
     # ---------------------------------------------------------
     # Search filters
@@ -1532,10 +1532,9 @@ class Serff:
         return True
 
     # ---------------------------------------------------------
-    # Not-down persistence: JSON is the source of truth; XLSX is derived
+    # Not-down persistence
     # ---------------------------------------------------------
     def _load_not_down_json(self) -> list:
-        """Return the current list of not-down entries (from disk, if any)."""
         path = self.config.not_downloaded_json_path
         if not path.is_file():
             return []
@@ -1548,7 +1547,6 @@ class Serff:
             return []
 
     def _save_not_down_json(self, entries: list):
-        """Atomic write of the not-down JSON."""
         path = self.config.not_downloaded_json_path
         tmp = path.with_suffix(path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -1557,12 +1555,6 @@ class Serff:
         logger.info(f"not_down.json updated: {path} ({len(entries)} entry(ies))")
 
     def _append_not_down(self, entry: dict):
-        """Merge a new not-down entry into not_down.json by `id`.
-
-        Reads the existing file so re-runs accumulate rather than overwrite.
-        Later entries win on duplicates (a re-run can promote `failed` ->
-        `skipped`, or refresh a `recorded_at` timestamp).
-        """
         entries = self._load_not_down_json()
         by_id = {e.get("id"): e for e in entries if e.get("id")}
         by_id[entry["id"]] = entry
@@ -1570,11 +1562,6 @@ class Serff:
         self._save_not_down_json(merged)
 
     def _export_not_down_xlsx(self):
-        """Convert not_down.json -> Not down.xlsx (best-effort).
-
-        Called at the end of every run (in `finally`) and by the standalone
-        `not_down_to_xlsx.py` script. Failure here never affects the run.
-        """
         try:
             entries = self._load_not_down_json()
             target = self.config.not_downloaded_xlsx_path
@@ -1704,9 +1691,18 @@ class Serff:
 
     def _download_once(self, data_rk, code, row_number):
         url = self.config.filing_url(data_rk)
+        self._last_filing_url = url
         logger.info(f"ROW {row_number}: Opening filing {data_rk}: {url}")
 
         self._load_page(url)
+
+        # Fast path: session-expired interstitial → retryable restart.
+        if self._is_session_expired_page():
+            logger.warning(
+                f"ROW {row_number}: Session-expired page detected on filing URL; "
+                f"re-establishing session and resuming at this URL."
+            )
+            raise SessionExpiredRetry("session expired")
 
         try:
             tracking_num = self._read_tracking_number()
@@ -1724,6 +1720,7 @@ class Serff:
         self.config.code_dir(code).mkdir(parents=True, exist_ok=True)
         self._save_filing_html(code, tracking_num, row_number)
 
+        # One-shot presence check (no 30s timeout on filings with no ZIP button).
         if not self.driver.find_elements(*Locators.DOWNLOAD_ZIP):
             logger.warning(
                 f"ROW {row_number}: No Download Zip File button on the filing "
@@ -1731,15 +1728,15 @@ class Serff:
             )
             self._screenshot(f"no_download_button_row_{row_number}")
             raise ZipNotAvailable("Download ZIP button not present on page")
-        
-        time.sleep(random.uniform(1,2))
+
+        time.sleep(random.uniform(1, 2))
         self._log_page_info()
 
         baseline = self._completed_downloads()
         original_handles = set(self.driver.window_handles)
 
         self._click(Locators.DOWNLOAD_ZIP, "Download Zip File button")
-        time.sleep(random.uniform(0.5,2))
+        time.sleep(random.uniform(0.5, 2))
         self._dismiss_blocking_dialogs(timeout=2)
 
         new_files = self._monitor_download(baseline, row_number)
@@ -1758,16 +1755,20 @@ class Serff:
             self._dismiss_blocking_dialogs(timeout=2)
 
     def _recover_page(self, problem, attempt):
+        """Recovery for non-session errors. Session-expiry is handled directly
+        in `_download_with_recovery` via SessionExpiredRetry."""
         if problem == "captcha" and attempt == 1 and self.handle_verification():
             return "refreshed"
+
         if problem in self.HARD_PROBLEMS or attempt >= 2:
-            self.restart_session()
+            self.restart_session_and_resume(self._last_filing_url)
             return "restarted"
+
         time.sleep(self.config.refresh_backoff * attempt)
         try:
             self._refresh()
         except WebDriverException:
-            self.restart_session()
+            self.restart_session_and_resume(self._last_filing_url)
             return "restarted"
         return "refreshed"
 
@@ -1789,6 +1790,23 @@ class Serff:
                 return True
             except (KeyboardInterrupt, SessionAbort):
                 raise
+            except SessionExpiredRetry as exc:
+                # Session expired mid-download → kill browser, redo BEGIN SEARCH /
+                # ACCEPT, jump straight back to the same filing URL, retry row.
+                reason = f"SessionExpiredRetry: {exc}".strip()[:300]
+                logger.warning(
+                    f"Row data-rk={data_rk}: session expired; re-establishing "
+                    f"session and resuming at {self._last_filing_url}."
+                )
+                self._screenshot(f"row_{data_rk}_session_expired")
+                try:
+                    self.restart_session_and_resume(self._last_filing_url)
+                except SessionAbort:
+                    raise
+                except Exception:
+                    logger.exception("Session re-establishment failed; letting retry fire.")
+                # Do not count this attempt as a row failure — retry the same row.
+                continue
             except ZipNotAvailable as exc:
                 reason = f"ZipNotAvailable: {exc}".strip()[:300]
                 logger.warning(
@@ -1842,13 +1860,6 @@ class Serff:
         return False
 
     def _cleanup_filing_folder(self, code, data_rk):
-        """Failed filing cleanup (flat layout: <today>/<Code>/<trackingId>.zip + .html).
-
-        - Keep  <trackingId>.html: it is the only record of what the filing page
-          looked like when the download failed, so it is retained for debugging/retry.
-        - Remove <trackingId>.zip if a partial/empty one was written, so the next
-          run does not mistake it for a completed download.
-        """
         record = self.store.records.get(data_rk) or {}
         tracking_num = record.get("tracking_number")
         if not tracking_num:
@@ -1904,7 +1915,7 @@ class Serff:
         return not failed
 
     # ---------------------------------------------------------
-    # Excel helpers (Last Comp Date / File Path; date-window rollover)
+    # Excel helpers
     # ---------------------------------------------------------
     def _ensure_excel_columns(self, df):
         if "Last Comp Date" not in df.columns:
@@ -2036,5 +2047,4 @@ if __name__ == "__main__":
         Serff().run()
     except DateWindowError as exc:
         logger.error(f"Cannot start: {exc}")
-        # Re-raise so the process exits with a non-zero status.
         raise
