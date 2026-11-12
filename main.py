@@ -251,23 +251,24 @@ class SerffConfig:
 
     def filing_url(self, data_rk):
         return self.filing_url_template.format(id=data_rk)
-
+    
     def _safe(self, value, fallback):
         return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or fallback))
 
     def code_dir(self, code) -> Path:
         return self.today_dir / self._safe(code, "unknown")
 
-    def filing_dir(self, code, tracking_num) -> Path:
-        # One folder per filing, named after the tracking number.
-        return self.code_dir(code) / self._safe(tracking_num, "unknown")
+    def filing_dir(self, code) -> Path:
+        # Flat layout: the filing artifacts live directly under the Code folder.
+        return self.code_dir(code)
 
     def filing_zip_path(self, code, tracking_num) -> Path:
-        return self.filing_dir(code, tracking_num) / f"{self._safe(tracking_num, 'unknown')}.zip"
+        name = self._safe(tracking_num, "unknown")
+        return self.filing_dir(code) / f"{name}.zip"
 
     def filing_html_path(self, code, tracking_num) -> Path:
-        return self.filing_dir(code, tracking_num) / f"{self._safe(tracking_num, 'unknown')}.html"
-
+        name = self._safe(tracking_num, "unknown")
+        return self.filing_dir(code) / f"{name}.html"
     # def criteria(self, start_date: str, end_date: str):
     #     """Identifies the search; saved JSON from a different search is archived."""
     #     return {
@@ -1613,7 +1614,8 @@ class Serff:
             record["tracking_number"] = tracking_num
 
         # Create the per-filing folder that matches the tracking number.
-        self.config.filing_dir(code, tracking_num).mkdir(parents=True, exist_ok=True)
+        # self.config.filing_dir(code, tracking_num).mkdir(parents=True, exist_ok=True)
+        self.config.code_dir(code).mkdir(parents=True, exist_ok=True)
 
         # -- Save the HTML *into* that folder ----------------------------------
         self._save_filing_html(code, tracking_num, row_number)
@@ -1696,12 +1698,12 @@ class Serff:
         return False
 
     def _cleanup_filing_folder(self, code, data_rk):
-        """Failed filing cleanup.  Layout:
-            <today>/<Code>/<tracking_num>/<tracking_num>.zip
-            <today>/<Code>/<tracking_num>/<tracking_num>.html
-        - Keep .html: it is the only record of what the filing page looked like
-        when the download failed, so it is retained for debugging/retry.
-        - Remove .zip if a partial/empty one was written.
+        """Failed filing cleanup (flat layout: <today>/<Code>/<trackingId>.zip + .html).
+
+        - Keep  <trackingId>.html: it is the only record of what the filing page
+        looked like when the download failed, so it is retained for debugging/retry.
+        - Remove <trackingId>.zip if a partial/empty one was written, so the next
+        run does not mistake it for a completed download.
         """
         record = self.store.records.get(data_rk) or {}
         tracking_num = record.get("tracking_number")
@@ -1709,10 +1711,6 @@ class Serff:
             logger.warning(
                 f"Cleanup skipped for data-rk={data_rk}: no tracking number recorded."
             )
-            return
-
-        folder = self.config.filing_dir(code, tracking_num)
-        if not folder.is_dir():
             return
 
         zip_path = self.config.filing_zip_path(code, tracking_num)
@@ -1726,7 +1724,8 @@ class Serff:
         html_path = self.config.filing_html_path(code, tracking_num)
         if html_path.is_file():
             logger.info(f"Kept filing HTML for debugging: {html_path}")
-            
+
+  
     def download_filings(self, df=None, index=None):
         pending = self.store.pending_keys()
         logger.info("=" * 70)
