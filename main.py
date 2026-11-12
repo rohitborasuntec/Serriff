@@ -190,10 +190,28 @@ class SerffConfig:
     max_session_attempts: int = 3
     restart_cooldown: int = 10
 
-    # Search filters
+    # Search filters — Business Type
+    # The <select id="simpleSearch:businessType_input"> options in the AL form:
+    #   0 = "-- Select --"
+    #   1 = "Property & Casualty"
+    #   2 = "Life, Accident/Health, Annuity, Credit"   <-- we want this
     business_type_index: int = 2
-    insurance_target: str = "LTC06 Long Term Care - Other"
 
+    # Search filters — Type of Insurance
+    # Every code in the SERFF "Type of Insurance" checkbox menu whose prefix is
+    # in the allow-list AND immediately followed by a digit is TICKED.
+    # Prefixes in the block-list win over the allow-list (so HOrg* is excluded
+    # even though it starts with H).
+    #
+    # Bare-word aggregate labels ("Annuity", "Health", "Life") are automatically
+    # excluded by the "digit-after-prefix" rule.
+    insurance_prefix_allowlist: tuple = ("A", "CR", "H", "L", "LTC", "MS")
+    insurance_prefix_blocklist: tuple = ("HOrg",)
+
+    # Optional safety check: if set, the ticked count must equal this number
+    # or the run aborts. Alabama's Type-of-Insurance menu yields exactly 104.
+    # Set to None to skip the check.
+    expected_tois_count: int | None = None
     # Direct filing URL. data-rk of a row == filingId.
     filing_url_template: str = (
         "https://serff-sfa.naic.org/serff/sfa/search/filingSummary.xhtml?filingId={id}"
@@ -234,31 +252,43 @@ class SerffConfig:
     def filing_url(self, data_rk):
         return self.filing_url_template.format(id=data_rk)
 
+    def _safe(self, value, fallback):
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or fallback))
+
     def code_dir(self, code) -> Path:
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(code or "unknown"))
-        return self.today_dir / safe
+        return self.today_dir / self._safe(code, "unknown")
 
-    def filing_dir(self, code, data_rk) -> Path:
-        # Flat layout: the filing lives directly under the Code folder.
-        return self.code_dir(code)
+    def filing_dir(self, code, tracking_num) -> Path:
+        # One folder per filing, named after the tracking number.
+        return self.code_dir(code) / self._safe(tracking_num, "unknown")
 
-    def filing_zip_path(self, code, data_rk) -> Path:
-        return self.filing_dir(code, data_rk) / f"{data_rk}.zip"
+    def filing_zip_path(self, code, tracking_num) -> Path:
+        return self.filing_dir(code, tracking_num) / f"{self._safe(tracking_num, 'unknown')}.zip"
 
-    def filing_html_path(self, code, data_rk) -> Path:
-        return self.filing_dir(code, data_rk) / f"{data_rk}.html"
-    
+    def filing_html_path(self, code, tracking_num) -> Path:
+        return self.filing_dir(code, tracking_num) / f"{self._safe(tracking_num, 'unknown')}.html"
+
+    # def criteria(self, start_date: str, end_date: str):
+    #     """Identifies the search; saved JSON from a different search is archived."""
+    #     return {
+    #         "state": self.state,
+    #         "start_date": start_date,
+    #         "end_date": end_date,
+    #         "business_type_index": self.business_type_index,
+    #         "insurance_prefix_allowlist": list(self.insurance_prefix_allowlist),
+    #         "insurance_prefix_blocklist": list(self.insurance_prefix_blocklist),
+    #         "rows_per_page": self.rows_per_page,
+    #     }
     def criteria(self, start_date: str, end_date: str):
-        """Identifies the search; saved JSON from a different search is archived."""
         return {
             "state": self.state,
             "start_date": start_date,
             "end_date": end_date,
             "business_type_index": self.business_type_index,
-            "insurance_target": self.insurance_target,
+            "insurance_prefix_allowlist": list(self.insurance_prefix_allowlist),
+            "insurance_prefix_blocklist": list(self.insurance_prefix_blocklist),
             "rows_per_page": self.rows_per_page,
         }
-
 
 # =============================================================
 # LOCATORS
@@ -271,7 +301,11 @@ class Locators:
     END_DATE = (By.XPATH, '//input[@id="simpleSearch:submissionEndDate_input"]')
     SEARCH = (By.XPATH, '//button[@id="simpleSearch:saveBtn"]')
     BUSINESS_TYPE = (By.XPATH, '//select[@id="simpleSearch:businessType_input"]')
-
+    SERFF_TRACKING_NUM = (
+        By.XPATH,
+        "//*[contains(text(),'SERFF Tracking Number: ')]"
+        "/following-sibling::*",
+    )
     INSURANCE_TRIGGER = (
         By.XPATH,
         '//*[contains(@class,"ui-selectcheckboxmenu")]'
@@ -480,6 +514,104 @@ class Serff:
     }
     HARD_PROBLEMS = {"session_expired", "blocked", "driver_dead"}
 
+    # =========================================================
+    # Type-of-Insurance ticker
+    # =========================================================
+    #
+    # Rule: a checkbox value is TICKED iff:
+    #   * some prefix in `allow` starts it AND the next character is a digit
+    #     (so "A01..." matches; bare "Annuity" does not)
+    #   * UNLESS some prefix in `block` starts it AND the next character is a
+    #     digit (so "HOrg02G" is excluded even though "H" is in allow)
+    #
+    # Applied to Alabama this selects exactly 104 of the 112 checkboxes.
+
+    _TICK_BY_PREFIX_JS = r"""
+        var allow = arguments[0];
+        var block = arguments[1];
+
+        function matches(v, prefixes) {
+            v = (v || "").trim().toUpperCase();
+            for (var i = 0; i < prefixes.length; i++) {
+                var p = prefixes[i].toUpperCase();
+                if (v.indexOf(p) === 0 && /[0-9]/.test(v.charAt(p.length))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function classify(v) {
+            if (matches(v, block)) return false;
+            return matches(v, allow);
+        }
+
+        var inputs = Array.prototype.slice.call(
+            document.querySelectorAll('input[name="simpleSearch:availableTois"]'));
+        var lis = Array.prototype.slice.call(
+            document.querySelectorAll('.ui-selectcheckboxmenu-items-wrapper ul li'));
+
+        var liByValue = {};
+        for (var i = 0; i < lis.length; i++) {
+            var lbl = lis[i].querySelector('label');
+            if (lbl) liByValue[(lbl.textContent || "").trim()] = lis[i];
+        }
+
+        var ticked = [], skipped = [];
+        for (var j = 0; j < inputs.length; j++) {
+            var val = (inputs[j].value || "").trim();
+            var should = classify(val);
+            (should ? ticked : skipped).push(val);
+
+            inputs[j].checked = should;
+            inputs[j].setAttribute('aria-checked', should ? 'true' : 'false');
+
+            var li = liByValue[val];
+            if (li) {
+                var box  = li.querySelector('.ui-chkbox-box');
+                var icon = li.querySelector('.ui-chkbox-icon');
+                var aria = li.querySelector('input[type="checkbox"]');
+                li.classList.toggle('ui-selectcheckboxmenu-checked',   should);
+                li.classList.toggle('ui-selectcheckboxmenu-unchecked', !should);
+                if (box)  box.classList.toggle('ui-state-active', should);
+                if (icon) {
+                    icon.classList.toggle('ui-icon-check', should);
+                    icon.classList.toggle('ui-icon-blank', !should);
+                }
+                if (aria) aria.setAttribute('aria-checked', should ? 'true' : 'false');
+            }
+        }
+
+        var w = null;
+        try { w = PrimeFaces.getWidgetById('simpleSearch:availableTois'); } catch (e) {}
+        if (w) {
+            try { if (w.updateLabel)   { w.updateLabel();   } } catch (e) {}
+            try { if (w.updateToggler) { w.updateToggler(); } } catch (e) {}
+            try { if (w.hasBehavior && w.hasBehavior('change')) {
+                    w.callBehavior('change');
+                } } catch (e) {}
+        }
+
+        var label = null;
+        var span = document.getElementById('simpleSearch:toisSelected');
+        if (span) {
+            var m = (span.textContent || "").match(/(\d+)/);
+            if (m) label = parseInt(m[1], 10);
+        }
+        var checked = document.querySelectorAll(
+            'input[name="simpleSearch:availableTois"]:checked').length;
+
+        return {
+            totalInputs: inputs.length,
+            totalLis:    lis.length,
+            wantChecked: ticked.length,
+            pageLabel:   label,
+            checkedNow:  checked,
+            ticked:      ticked,
+            skipped:     skipped
+        };
+    """
+
     def __init__(self, config=None, browser=None):
         self.config = config or SerffConfig()
 
@@ -490,6 +622,7 @@ class Serff:
             headless=False,
             download_dir=str(self.config.download_dir),
         )
+
         self.driver = None
         self.store = ProgressStore(
             self.config.progress_json,
@@ -795,16 +928,46 @@ class Serff:
             )
         except TimeoutException:
             logger.warning("URL did not change after BEGIN SEARCH.")
-        time.sleep(2)
+        time.sleep(random.uniform(1, 3))
         self._log_page_info()
         return self.handle_verification()
 
-    def accept_terms(self):
-        logger.info("STEP 4: Clicking ACCEPT.")
+    def accept_terms(self, attempt=5):
+        if attempt == 0:
+            logger.error("Page Stuck: 'Filing Search' never appeared after ACCEPT.")
+            self._screenshot("accept_terms_stuck")
+            return False
+
+        logger.info(f"STEP 4: Clicking ACCEPT (attempt {6 - attempt}/5).")
+
         self._wait_with_refresh(Locators.ACCEPT, "ACCEPT button", condition="presence")
         self._click(Locators.ACCEPT, "ACCEPT button")
+
         if not self.handle_verification():
+            logger.error("ACCEPT: human verification not completed.")
             return False
+
+        # Wait up to 5 s for the search form to become visible.
+        try:
+            WebDriverWait(self.driver, 5).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//*[contains(normalize-space(.), 'Filing Search')]")
+                )
+            )
+            logger.info("ACCEPT: 'Filing Search' detected on the page.")
+        except TimeoutException:
+            logger.warning(
+                "'Filing Search' not detected within 5s after ACCEPT; "
+                "refreshing and retrying."
+            )
+            try:
+                self._refresh()
+            except WebDriverException:
+                logger.exception("Refresh failed during ACCEPT retry.")
+                return False
+            return self.accept_terms(attempt=attempt - 1)
+
+        # Search form is up — wait for the actual Start Date input before returning.
         self._wait_with_refresh(Locators.START_DATE, "Start Submission Date input")
         return True
 
@@ -843,106 +1006,154 @@ class Serff:
     # Search filters
     # ---------------------------------------------------------
     def _select_business_type(self):
-        logger.info(f"FILTER: Selecting Business Type option[{self.config.business_type_index + 1}].")
+        """Select 'Life, Accident/Health, Annuity, Credit' (index 2)."""
+        index = self.config.business_type_index
+        logger.info(f"FILTER: Selecting Business Type option[{index}].")
+
         select_el = WebDriverWait(self.driver, self.config.element_timeout).until(
             EC.presence_of_element_located(Locators.BUSINESS_TYPE)
         )
-        Select(select_el).select_by_index(self.config.business_type_index)
+        options = select_el.find_elements(By.TAG_NAME, "option")
+        if index >= len(options):
+            raise RuntimeError(
+                f"Business Type index {index} out of range "
+                f"(page has {len(options)} options)."
+            )
+        expected_label = options[index].text.strip()
+        if "Life" not in expected_label:
+            raise RuntimeError(
+                f"Business Type[{index}] is '{expected_label}', expected a label "
+                f"containing 'Life'. Refusing to continue."
+            )
+
+        Select(select_el).select_by_index(index)
         self.driver.execute_script(
-            "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+            "arguments[0].dispatchEvent(new Event('input',  {bubbles:true}));"
             "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
             select_el,
         )
-        selected = select_el.find_element(
-            By.XPATH, f"./option[{self.config.business_type_index + 1}]"
-        ).text.strip()
-        logger.info(f"FILTER: Business Type selected: {selected}")
+        logger.info(f"FILTER: Business Type selected: {expected_label}")
 
         self._wait_ajax_idle()
         time.sleep(randint(1, 3))
 
-    _TICK_UP_TO_JS = """
-        var target = arguments[0].trim().toLowerCase();
-        var inputs = Array.prototype.slice.call(
-            document.querySelectorAll('input[name="simpleSearch:availableTois"]'));
-        var idx = -1;
-        for (var i = 0; i < inputs.length; i++) {
-            if (inputs[i].value.trim().toLowerCase() === target) { idx = i; break; }
-        }
-        if (idx < 0) { return {found: false, total: inputs.length}; }
+    def _read_tracking_number(self, timeout=None):
+        """Read the SERFF Tracking Number shown on a filing page.
 
-        for (var j = 0; j < inputs.length; j++) { inputs[j].checked = (j <= idx); }
-
-        var lis = document.querySelectorAll('.ui-selectcheckboxmenu-items-wrapper ul li');
-        for (var k = 0; k < lis.length; k++) {
-            var on = (k <= idx);
-            var box = lis[k].querySelector('.ui-chkbox-box');
-            var icon = box ? box.querySelector('.ui-chkbox-icon') : null;
-            if (box) { box.classList.toggle('ui-state-active', on); }
-            if (icon) { icon.classList.toggle('ui-icon-check', on); icon.classList.toggle('ui-icon-blank', !on); }
-            lis[k].classList.toggle('ui-selectcheckboxmenu-checked', on);
-        }
-
-        var w = null;
-        try { w = PrimeFaces.getWidgetById('simpleSearch:availableTois'); } catch (e) {}
-        if (w) {
-            try { if (w.updateLabel) { w.updateLabel(); } } catch (e) {}
-            try { if (w.updateToggler) { w.updateToggler(); } } catch (e) {}
-            try { if (w.hasBehavior && w.hasBehavior('change')) { w.callBehavior('change'); } } catch (e) {}
-        }
-        return {found: true, total: inputs.length, index: idx, checked: idx + 1};
-    """
-
-    _CLICK_UP_TO_JS = """
-        var idx = arguments[0];
-        var inputs = document.querySelectorAll('input[name="simpleSearch:availableTois"]');
-        var lis = document.querySelectorAll('.ui-selectcheckboxmenu-items-wrapper ul li');
-        for (var i = 0; i <= idx && i < lis.length; i++) {
-            if (!inputs[i].checked) { lis[i].click(); }
-        }
-        return document.querySelectorAll('input[name="simpleSearch:availableTois"]:checked').length;
-    """
-
-    _COUNT_CHECKED_JS = (
-        "return document.querySelectorAll("
-        "'input[name=\"simpleSearch:availableTois\"]:checked').length;"
-    )
-
+        The value is displayed as a label-value pair:
+            <span>SERFF Tracking Number: </span> <span>AL-2024-00123</span>
+        The XPath matches the element *after* the label.  Waits for it to be
+        present and non-empty; returns the stripped string.
+        """
+        timeout = timeout or self.config.element_timeout
+        logger.info("Reading SERFF Tracking Number from filing page.")
+        try:
+            el = WebDriverWait(self.driver, timeout).until(
+                EC.presence_of_element_located(Locators.SERFF_TRACKING_NUM)
+            )
+            # Wait for non-empty text (page renders empty span briefly)
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: (el.text or "").strip() != ""
+            )
+            value = el.text.strip()
+            logger.info(f"Tracking number: {value}")
+            return value
+        except TimeoutException:
+            logger.error("SERFF Tracking Number not found / still empty.")
+            self._screenshot("tracking_number_missing")
+            raise RuntimeError("Could not read SERFF Tracking Number from filing page.")
+        
     def _select_insurance_types(self):
-        target_text = self.config.insurance_target
+        """Tick every Type-of-Insurance code whose prefix is in the allow-list
+        AND whose prefix is immediately followed by a digit (so bare labels like
+        'Annuity', 'Health', 'Life', 'HMO' are not ticked).  Blocklist wins over
+        allow-list ('HOrg' beats 'H').
 
-        result = self.driver.execute_script(self._TICK_UP_TO_JS, target_text)
-        if not result.get("found"):
-            logger.error(f"FILTER: Target insurance item '{target_text}' not found "
-                         f"({result.get('total')} items on the page).")
-            self._screenshot("insurance_target_not_found")
-            raise RuntimeError(f"Type of Insurance target not found: {target_text}")
+        Verification:
+        * PRIMARY: hidden inputs are the exact set the form will submit.
+                    Every allow-matched input is checked; every other is not.
+        * OPTIONAL: if the caller sets config.expected_tois_count (non-None),
+                    the DOM count must equal it, otherwise abort.
+        * ADVISORY: the page's 'N Types of Insurance selected' label.  That
+                    label is server-rendered and is only refreshed by an
+                    AJAX post-back (e.g. pressing Search).  On a freshly-loaded
+                    form it still reads '0 Types of Insurance selected' even
+                    after the DOM has been ticked correctly, so we never abort
+                    on it.
+        """
+        allow = list(self.config.insurance_prefix_allowlist)
+        block = list(self.config.insurance_prefix_blocklist)
 
-        expected = result["checked"]
+        logger.info(f"FILTER: Ticking Type of Insurance codes with prefixes {allow}, "
+                    f"excluding {block}.")
+
+        def _state():
+            return self.driver.execute_script(self._TICK_BY_PREFIX_JS, allow, block)
+
+        result = _state()
+        logger.info(f"FILTER: checkbox pass -> {result}")
         self._wait_ajax_idle()
-        actual = self.driver.execute_script(self._COUNT_CHECKED_JS)
-        logger.info(f"FILTER: Direct tick selected {actual}/{expected} Type of Insurance items.")
+        time.sleep(1)
 
-        if actual != expected:
-            logger.warning("FILTER: Direct tick did not stick; falling back to widget clicks.")
-            self._click(Locators.INSURANCE_TRIGGER, "Type of Insurance dropdown")
-            self.driver.execute_script(self._CLICK_UP_TO_JS, result["index"])
-            self._wait_ajax_idle(timeout=60)
-            actual = self.driver.execute_script(self._COUNT_CHECKED_JS)
-            if actual != expected:
+        want   = result["wantChecked"]
+        have   = result["checkedNow"]
+        label  = result["pageLabel"]
+
+        # ---- OPTIONAL count gate (off by default) ----------------------------
+        if (self.config.expected_tois_count is not None
+                and want != self.config.expected_tois_count):
+            self._screenshot("tois_count_mismatch")
+            raise RuntimeError(
+                f"Type of Insurance count drifted: classify() produced {want}, "
+                f"config expects {self.config.expected_tois_count}. "
+                f"page label = {label}, DOM checked = {have}. "
+                f"Skipped values ({len(result.get('skipped', []))}): "
+                f"{result.get('skipped', [])}"
+            )
+
+        # ---- PRIMARY: the DOM state must match exactly -----------------------
+        if have != want:
+            time.sleep(1)
+            result = _state()
+            want, have, label = (result["wantChecked"],
+                                result["checkedNow"],
+                                result["pageLabel"])
+            if have != want:
                 self._screenshot("insurance_selection_mismatch")
-                raise RuntimeError(f"Expected {expected} insurance items checked, found {actual}.")
-            try:
-                self.driver.find_element(By.TAG_NAME, "body").click()
-            except WebDriverException:
-                pass
+                raise RuntimeError(
+                    f"Type of Insurance DOM mismatch: expected {want}, "
+                    f"checked DOM = {have} (page label = {label})."
+                )
 
-        logger.info(f"FILTER: Completed Type of Insurance selection through '{target_text}'.")
+        # ---- ADVISORY: page label --------------------------------------------
+        if label is None:
+            logger.info(f"FILTER: Confirmed {want} checkboxes ticked "
+                        f"(page has no label element). ✅")
+        elif label == want:
+            logger.info(f"FILTER: Confirmed {want} checkboxes ticked; "
+                        f"page label agrees ({label}). ✅")
+        elif label == 0:
+            logger.info(
+                f"FILTER: Confirmed {want} checkboxes ticked. "
+                f"Page label reads '0 Types of Insurance selected' — expected on a "
+                f"freshly-loaded form (label refreshes only after Search). ✅"
+            )
+        else:
+            logger.warning(
+                f"FILTER: Page label says {label}, DOM says {have}, expected {want}. "
+                f"Proceeding on DOM state (label is server-rendered)."
+            )
 
+        logger.info(
+            f"FILTER: Completed Type of Insurance selection through all "
+            f"{len(allow)} prefixes ({want} of {result['totalInputs']} items ticked). "
+            f"Skipped ({len(result.get('skipped', []))}): {result.get('skipped', [])}"
+        )
     def apply_search_filters(self):
         logger.info("STEP 5: Applying Business Type and Type of Insurance filters.")
         self._select_business_type()
         self._select_insurance_types()
+        
 
     def _enter_date(self, locator, value, label):
         logger.info(f"Entering {label} {value}.")
@@ -1350,11 +1561,11 @@ class Serff:
                 logger.info(f"ROW {row_number}: New completed download: {path}")
         return set(new_files)
 
-    def _move_zip_into_filing_folder(self, zip_paths, code, data_rk, row_number):
+    def _move_zip_into_filing_folder(self, zip_paths, code, tracking_num, row_number):
         if not zip_paths:
             return None
         source = max(zip_paths, key=lambda p: Path(p).stat().st_size)
-        target = self.config.filing_zip_path(code, data_rk)
+        target = self.config.filing_zip_path(code, tracking_num)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             logger.warning(f"ROW {row_number}: Overwriting existing ZIP: {target}")
@@ -1369,9 +1580,9 @@ class Serff:
                     pass
         return target
 
-    def _save_filing_html(self, code, data_rk, row_number):
+    def _save_filing_html(self, code, tracking_num, row_number):
         try:
-            target = self.config.filing_html_path(code, data_rk)
+            target = self.config.filing_html_path(code, tracking_num)
             target.parent.mkdir(parents=True, exist_ok=True)
             html = self.driver.page_source
             target.write_text(html, encoding="utf-8")
@@ -1386,15 +1597,28 @@ class Serff:
         url = self.config.filing_url(data_rk)
         logger.info(f"ROW {row_number}: Opening filing {data_rk}: {url}")
 
-        self.config.filing_dir(code, data_rk).mkdir(parents=True, exist_ok=True)
-
         self._load_page(url)
-        self._wait_with_refresh(Locators.DOWNLOAD_ZIP, "Download Zip File button", condition="presence")
+        self._wait_with_refresh(
+            Locators.DOWNLOAD_ZIP, "Download Zip File button", condition="presence"
+        )
         time.sleep(2)
         self._log_page_info()
 
-        self._save_filing_html(code, data_rk, row_number)
+        # -- Resolve tracking number BEFORE creating the filing folder -----------
+        tracking_num = self._read_tracking_number()
 
+        # Persist it in the record so subsequent runs / cleanup / xlsx can use it.
+        record = self.store.records.get(data_rk)
+        if record is not None:
+            record["tracking_number"] = tracking_num
+
+        # Create the per-filing folder that matches the tracking number.
+        self.config.filing_dir(code, tracking_num).mkdir(parents=True, exist_ok=True)
+
+        # -- Save the HTML *into* that folder ----------------------------------
+        self._save_filing_html(code, tracking_num, row_number)
+
+        # -- Click Download, monitor, move ZIP ---------------------------------
         baseline = self._completed_downloads()
         original_handles = set(self.driver.window_handles)
 
@@ -1409,7 +1633,9 @@ class Serff:
                 raise RuntimeError(
                     f"ZIP download not detected within {self.config.download_wait}s"
                 )
-            self._move_zip_into_filing_folder(new_files, code, data_rk, row_number)
+            self._move_zip_into_filing_folder(
+                new_files, code, tracking_num, row_number
+            )
             return True
         finally:
             self._close_extra_windows(original_handles)
@@ -1463,25 +1689,33 @@ class Serff:
             "data_rk": data_rk,
             "website": website or "",
             "code": code or "",
+            "tracking_num": (self.store.records.get(data_rk) or {}).get("tracking_number", ""),
             "file_url": self.config.filing_url(data_rk),
             "reason": reason,
         })
         return False
 
     def _cleanup_filing_folder(self, code, data_rk):
+        """Failed filing cleanup.  Layout:
+            <today>/<Code>/<tracking_num>/<tracking_num>.zip
+            <today>/<Code>/<tracking_num>/<tracking_num>.html
+        - Keep .html: it is the only record of what the filing page looked like
+        when the download failed, so it is retained for debugging/retry.
+        - Remove .zip if a partial/empty one was written.
         """
-        Failed filing cleanup (flat layout: <today>/<Code>/<id>.zip + <id>.html).
+        record = self.store.records.get(data_rk) or {}
+        tracking_num = record.get("tracking_number")
+        if not tracking_num:
+            logger.warning(
+                f"Cleanup skipped for data-rk={data_rk}: no tracking number recorded."
+            )
+            return
 
-        - Keep <id>.html: it is the only record of what the filing page looked
-          like when the download failed, so it is retained for debugging/retry.
-        - Remove <id>.zip if a partial/empty one was written, so the next run
-          does not mistake it for a completed download.
-        """
-        folder = self.config.filing_dir(code, data_rk)
+        folder = self.config.filing_dir(code, tracking_num)
         if not folder.is_dir():
             return
 
-        zip_path = self.config.filing_zip_path(code, data_rk)
+        zip_path = self.config.filing_zip_path(code, tracking_num)
         if zip_path.is_file():
             try:
                 zip_path.unlink()
@@ -1489,10 +1723,10 @@ class Serff:
             except OSError:
                 logger.exception(f"Could not remove {zip_path}")
 
-        html_path = self.config.filing_html_path(code, data_rk)
+        html_path = self.config.filing_html_path(code, tracking_num)
         if html_path.is_file():
             logger.info(f"Kept filing HTML for debugging: {html_path}")
-
+            
     def download_filings(self, df=None, index=None):
         pending = self.store.pending_keys()
         logger.info("=" * 70)
@@ -1540,6 +1774,7 @@ class Serff:
                 "File Url": item.get("file_url", ""),
                 "Code": item.get("code", ""),
                 "ID": item.get("data_rk", ""),
+                "Tracking Number": item.get("tracking_num", ""),
                 "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
 
