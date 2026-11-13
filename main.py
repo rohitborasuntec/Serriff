@@ -764,7 +764,7 @@ class Serff:
                 # Return immediately so the caller (begin_search, accept_terms, etc.)
                 # can wait for the actual page elements to load naturally.
                 logger.info("Captcha solved; waiting for redirect to complete.")
-                time.sleep(random.uniform(1,3)) # Give the browser a moment to process the redirect
+                time.sleep(random.uniform(3,5)) # Give the browser a moment to process the redirect
                 return
 
             # ---- 2) SESSION-EXPIRED ---------------------------------------
