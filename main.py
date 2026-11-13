@@ -747,7 +747,6 @@ class Serff:
                 except TimeoutException:
                     logger.warning("Navigation timed out. Checking current page.")
                 except WebDriverException as exc:
-                    # If get() fails immediately, the driver might be dead
                     logger.error(f"Driver failed to navigate: {exc}")
                     raise RuntimeError("driver_dead") from exc
             else:
@@ -760,16 +759,13 @@ class Serff:
                 logger.warning(f"CAPTCHA detected on {url}; attempting to solve.")
                 if not self.handle_verification():
                     raise RuntimeError("Captcha could not be solved.")
-                if self._is_verification_page():
-                    raise RuntimeError("Captcha still present after solving.")
-                if self._is_session_expired_page():
-                    raise SessionExpiredRetry(f"session expired after captcha on {url}")
-                if self._is_server_error_page():
-                    raise SessionExpiredRetry(f"HTTP 5xx on {url} (after captcha)")
                 
-                problem = self._page_problem()
-                if problem is None or problem not in self.HARD_PROBLEMS:
-                    return
+                # Successfully solved. The page is now redirecting. 
+                # Return immediately so the caller (begin_search, accept_terms, etc.)
+                # can wait for the actual page elements to load naturally.
+                logger.info("Captcha solved; waiting for redirect to complete.")
+                time.sleep(random.uniform(1,3)) # Give the browser a moment to process the redirect
+                return
 
             # ---- 2) SESSION-EXPIRED ---------------------------------------
             if self._is_session_expired_page():
@@ -787,6 +783,9 @@ class Serff:
                 logger.warning(f"CAPTCHA appeared post-settle on {url}.")
                 if not self.handle_verification():
                     raise RuntimeError("Captcha could not be solved.")
+                time.sleep(2)
+                return
+                
             if self._is_session_expired_page():
                 raise SessionExpiredRetry(f"session expired on {url} (post-settle)")
             if self._is_server_error_page():
