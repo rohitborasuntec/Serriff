@@ -30,7 +30,7 @@ def solve_capctha(driver):
 
     solver = TwoCaptcha(api_key)
     user_agent = driver.execute_script("return navigator.userAgent;")
-  
+    
     props = None
     for _ in range(20):
         props = driver.execute_script("return window.gokuProps || null;")
@@ -75,7 +75,7 @@ def solve_capctha(driver):
 
     # Target base domain for cookie scoping
     cookie_domain = "serff-sfa.naic.org"
-
+    time.sleep(random.uniform(0,2))
     # Loop and safely attach formatted cookies to Selenium
     for name, value in cookies_to_inject.items():
         try:
@@ -87,7 +87,7 @@ def solve_capctha(driver):
             })
         except Exception as cookie_err:
             print(f"Skipping cookie injection payload error for {name}: {cookie_err}")
-
+    time.sleep(random.uniform(3,5))
     # Refresh the session to submit tokens to the WAF layer
     driver.refresh()
 

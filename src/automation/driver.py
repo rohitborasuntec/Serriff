@@ -273,8 +273,8 @@ class Browser:
         os.makedirs(profile_dir, exist_ok=True)
         options.add_argument(f"--user-data-dir={profile_dir}")
 
-        if self.incognito:
-            options.add_argument("--incognito")
+        # if self.incognito:
+        #     options.add_argument("--incognito")
         if self.user_agent:
             options.add_argument(f"--user-agent={self.user_agent}")
         if self.proxy:
