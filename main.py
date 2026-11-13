@@ -691,7 +691,18 @@ class Serff:
             ))
         except WebDriverException:
             return False
-
+    def _is_server_error_page(self):
+        """True if the page is a SERFF HTTP 5xx error page."""
+        try:
+            html = (self.driver.page_source or "").lower()
+            if "http 500" in html or "http 502" in html or "http 503" in html or "http 504" in html:
+                return True
+            if "internal server error" in html or "bad gateway" in html or "service unavailable" in html:
+                return True
+            return False
+        except WebDriverException:
+            return False
+            
     def _page_problem(self):
         if self.driver is None:
             return "driver_dead"
@@ -726,8 +737,6 @@ class Serff:
             logger.warning("Refresh timed out; checking current page.")
 
     def _load_page(self, url):
-        """Every driver.get is followed by THREE session-expiry checks:
-        (a) immediately, (b) after 1 s settle, (c) after any refresh."""
         problem = None
         for attempt in range(self.config.max_refreshes + 1):
             if attempt == 0:
@@ -740,12 +749,23 @@ class Serff:
                 time.sleep(self.config.refresh_backoff * attempt)
                 self._refresh()
 
+            # 1) Immediate post-navigation check.
             if self._is_session_expired_page():
                 raise SessionExpiredRetry(f"session expired after navigating to {url}")
 
+            # 2) HTTP 5xx check — treat exactly like session expiry: refresh
+            #    the session on the same browser, then re-open this URL.
+            if self._is_server_error_page():
+                logger.warning(f"HTTP 5xx detected on {url}; will refresh session and retry.")
+                raise SessionExpiredRetry(f"HTTP 5xx on {url}")
+
+            # 3) Post-settle check.
             time.sleep(1)
             if self._is_session_expired_page():
                 raise SessionExpiredRetry(f"session expired on {url} (post-settle)")
+            if self._is_server_error_page():
+                logger.warning(f"HTTP 5xx detected on {url} (post-settle); will refresh session.")
+                raise SessionExpiredRetry(f"HTTP 5xx on {url} (post-settle)")
 
             problem = self._page_problem()
             if problem is None:
@@ -1547,11 +1567,18 @@ class Serff:
         self._last_filing_url = url
         self._load_page(url)
 
+        # Post-load 5xx re-check — the page may have flipped to 5xx after the
+        # initial healthy check (SERFF sometimes does this on partial outages).
+        if self._is_server_error_page():
+            raise SessionExpiredRetry(f"HTTP 5xx on filing page {url}")
+        if self._is_session_expired_page():
+            raise SessionExpiredRetry(f"session expired on filing page {url}")
+
         try:
             tracking_num = self._read_tracking_number()
         except RuntimeError:
             raise ZipNotAvailable("SERFF Tracking Number not readable")
-
+        
         record = self.store.records.get(data_rk)
         if record is not None:
             record["tracking_number"] = tracking_num
