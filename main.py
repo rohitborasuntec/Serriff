@@ -592,7 +592,7 @@ class Serff:
     # ---------------------------------------------------------
     def start_browser(self):
         logger.info("Starting Chrome WebDriver.")
-        self.driver = self.browser.get_firefox()
+        self.driver = self.browser.get_chrome()
         self.driver.set_page_load_timeout(self.config.page_load_timeout)
         self.config.download_dir.mkdir(parents=True, exist_ok=True)
         self.config.today_dir.mkdir(parents=True, exist_ok=True)
