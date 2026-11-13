@@ -1597,28 +1597,55 @@ class Serff:
         row_number = self.store.completed_count + 1
         self._current_site_url = website or self.config.site_home_url
         max_tries = self.config.max_row_retries
+        max_session_retries = self.config.max_session_attempts * 3   # independent budget
         reason, terminal = "unknown", False
 
-        for attempt in range(1, max_tries + 1):
+        attempt = 0                 # real-failure counter
+        session_retries = 0         # session-refresh counter (does not consume `attempt`)
+
+        while attempt < max_tries:
+            attempt += 1
             logger.info("=" * 70)
-            logger.info(f"ROW {row_number} | data-rk={data_rk} | code={code} | attempt {attempt}/{max_tries}")
+            logger.info(
+                f"ROW {row_number} | data-rk={data_rk} | code={code} | "
+                f"attempt {attempt}/{max_tries} | session_retries {session_retries}/{max_session_retries}"
+            )
             try:
                 self._download_once(data_rk, code, row_number)
                 self.store.mark_completed(data_rk, confirmed=True)
                 self._restarts = 0
                 return True
+
             except (KeyboardInterrupt, SessionAbort):
                 raise
+
             except SessionExpiredRetry as exc:
-                reason = f"SessionExpiredRetry: {exc}".strip()[:300]
+                # Do NOT consume the row's retry budget — refresh session and try again.
+                attempt -= 1                    # undo the increment above
+                session_retries += 1
+                if session_retries > max_session_retries:
+                    logger.error(
+                        f"ROW {row_number}: session expired {session_retries} times — "
+                        f"giving up on this row."
+                    )
+                    reason = f"SessionExpiredRetry (too many): {exc}"[:300]
+                    break
+                logger.warning(
+                    f"ROW {row_number}: session expired ({exc}); refreshing session "
+                    f"and resuming at {self._last_filing_url} "
+                    f"(session_retries {session_retries}/{max_session_retries})."
+                )
                 self._screenshot(f"row_{data_rk}_session_expired")
                 try:
                     self.restart_session_and_resume(self._last_filing_url)
                 except SessionAbort:
                     raise
                 except Exception:
-                    logger.exception("Session refresh failed; retrying.")
-                continue
+                    logger.exception("Session refresh failed; retrying anyway.")
+                # Do NOT increment `attempt`; loop naturally increments it next time
+                # only when we re-enter with attempt < max_tries.
+                attempt -= 1                     # already undone above; kept for clarity
+
             except ZipNotAvailable as exc:
                 reason = f"ZipNotAvailable: {exc}".strip()[:300]
                 self._screenshot(f"row_{data_rk}_no_zip")
@@ -1636,20 +1663,20 @@ class Serff:
                 })
                 terminal = True
                 break
+
             except Exception as exc:
                 reason = f"{type(exc).__name__}: {exc}".strip()[:300]
                 self._screenshot(f"row_{data_rk}_error")
-                if attempt == max_tries:
+                if attempt >= max_tries:
                     break
                 problem = self._page_problem()
                 self._recover_page(problem, attempt)
 
         if not terminal:
             logger.error(
-                f"Row data-rk={data_rk} failed {max_tries} time(s); "
-                f"marking as TERMINAL (won't be retried on next run)."
+                f"Row data-rk={data_rk} failed (terminal). reason: {reason}"
             )
-            self.store.mark_skipped(data_rk, f"Failed after {max_tries} attempts: {reason}")
+            self.store.mark_skipped(data_rk, reason)
             self._cleanup_filing_folder(code, data_rk)
             self._append_not_down({
                 "id": data_rk,
@@ -1662,7 +1689,7 @@ class Serff:
                 "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
         return False
-
+    
     def _cleanup_filing_folder(self, code, data_rk):
         record = self.store.records.get(data_rk) or {}
         tracking_num = record.get("tracking_number")
