@@ -48,7 +48,7 @@ from pathlib import Path
 from random import randint
 
 import pandas as pd
-
+from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException
 from selenium.common.exceptions import (
     StaleElementReferenceException,
     TimeoutException,
@@ -175,7 +175,7 @@ class SerffConfig:
     max_row_retries: int = 3
     max_collect_failures: int = 6
     max_consecutive_restarts: int = 5
-    max_session_attempts: int = 3
+    max_session_attempts: int = 5
     restart_cooldown: int = 10
 
     business_type_index: int = 2
@@ -716,6 +716,7 @@ class Serff:
             self._accept_alert()
             return "alert"
         except WebDriverException:
+            # This catches InvalidSessionIdException, NoSuchWindowException, etc.
             return "driver_dead"
 
         haystack = f"{title}\n{text}"
@@ -729,7 +730,7 @@ class Serff:
         if not text.strip():
             return "blank"
         return None
-
+    
     def _refresh(self):
         try:
             self.driver.refresh()
@@ -737,11 +738,7 @@ class Serff:
             logger.warning("Refresh timed out; checking current page.")
 
     def _load_page(self, url):
-        """Navigate to `url`; verify healthy. Order of checks:
-        1. Captcha / verification  → try to solve it
-        2. Session-expired         → raise SessionExpiredRetry
-        3. HTTP 5xx                → raise SessionExpiredRetry (same recovery)
-        """
+        """Navigate to `url`; verify healthy. Order: CAPTCHA -> EXPIRY -> 5xx -> DEAD."""
         problem = None
         for attempt in range(self.config.max_refreshes + 1):
             if attempt == 0:
@@ -749,6 +746,10 @@ class Serff:
                     self.driver.get(url)
                 except TimeoutException:
                     logger.warning("Navigation timed out. Checking current page.")
+                except WebDriverException as exc:
+                    # If get() fails immediately, the driver might be dead
+                    logger.error(f"Driver failed to navigate: {exc}")
+                    raise RuntimeError("driver_dead") from exc
             else:
                 logger.warning(f"Page problem '{problem}'; refresh {attempt}/{self.config.max_refreshes}.")
                 time.sleep(self.config.refresh_backoff * attempt)
@@ -759,15 +760,13 @@ class Serff:
                 logger.warning(f"CAPTCHA detected on {url}; attempting to solve.")
                 if not self.handle_verification():
                     raise RuntimeError("Captcha could not be solved.")
-                # After solving, re-check — the page may now be the form, or
-                # may still be broken, or may now show session-expired.
                 if self._is_verification_page():
                     raise RuntimeError("Captcha still present after solving.")
                 if self._is_session_expired_page():
                     raise SessionExpiredRetry(f"session expired after captcha on {url}")
                 if self._is_server_error_page():
                     raise SessionExpiredRetry(f"HTTP 5xx on {url} (after captcha)")
-                # Fall through to normal problem detection below (blank / blocked).
+                
                 problem = self._page_problem()
                 if problem is None or problem not in self.HARD_PROBLEMS:
                     return
@@ -776,13 +775,14 @@ class Serff:
             if self._is_session_expired_page():
                 raise SessionExpiredRetry(f"session expired after navigating to {url}")
 
-            # ---- 3) HTTP 5xx (same recovery as session-expired) -----------
+            # ---- 3) HTTP 5xx ----------------------------------------------
             if self._is_server_error_page():
                 logger.warning(f"HTTP 5xx detected on {url}; will refresh session and retry.")
                 raise SessionExpiredRetry(f"HTTP 5xx on {url}")
 
-            # ---- post-settle re-checks (order preserved) ------------------
+            # ---- post-settle re-checks ------------------------------------
             time.sleep(1)
+            
             if self._is_verification_page():
                 logger.warning(f"CAPTCHA appeared post-settle on {url}.")
                 if not self.handle_verification():
@@ -805,7 +805,7 @@ class Serff:
                 raise RuntimeError(f"Page problem requiring a new session: {problem}")
 
         raise RuntimeError(f"Page still broken after {self.config.max_refreshes} refreshes: {problem}")
-
+    
     def _wait_with_refresh(self, locator, description, condition="visible"):
         tries = self.config.max_refreshes
         for attempt in range(tries + 1):
@@ -836,6 +836,8 @@ class Serff:
     def _is_verification_page(self):
         try:
             return bool(is_verification_page(self.driver))
+        except (InvalidSessionIdException, NoSuchWindowException):
+            raise
         except Exception:
             return False
 
@@ -1030,10 +1032,23 @@ class Serff:
             except Exception:
                 logger.exception(f"Session set-up failed (attempt {attempt}).")
                 self._screenshot("session_setup_failure")
-            self.close()
+                
+                # --- REUSE THE SAME BROWSER ---
+                # Do NOT call self.close(). Just try to reset the page.
+                if self.driver is not None:
+                    try:
+                        target_url = url or self._current_site_url or self.config.site_home_url
+                        logger.info(f"Restarting session flow by re-hitting: {target_url}")
+                        self._load_page(target_url)
+                    except Exception:
+                        logger.exception("Failed to reload page; will retry anyway.")
+                else:
+                    # Only start a new browser if it was already dead
+                    self.start_browser()
+            
             time.sleep(self.config.restart_cooldown * attempt)
+            
         raise SessionAbort("Could not establish a SERFF session.")
-
     # ---------------------------------------------------------
     # Rule 4: SAME-browser session refresh
     # ---------------------------------------------------------
