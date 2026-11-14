@@ -1118,7 +1118,7 @@ class Serff:
             select_el,
         )
         self._wait_ajax_idle()
-        time.sleep(self.human.pause(1, 3))
+        self.human.pause(1, 3)
 
     def _read_tracking_number(self, timeout=None):
         timeout = timeout or self.config.element_timeout
