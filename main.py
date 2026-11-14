@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, date
 from pathlib import Path
 from random import randint
-
+from src.automation.human import Human
 import pandas as pd
 from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException
 from selenium.common.exceptions import (
@@ -150,7 +150,9 @@ class DateWindow:
     def as_dict(self) -> dict:
         return {"start_date": self.start.isoformat(), "end_date": self.end.isoformat()}
 
-
+    @property
+    def start_iso(self) -> str:
+        return self.start.isoformat()
 # =============================================================
 # CONFIGURATION
 # =============================================================
@@ -569,6 +571,7 @@ class Serff:
         self.window = DateWindow(self.config.window_json_path)
         self.browser = browser or Browser(
             headless=False, download_dir=str(self.config.download_dir),
+            user_agent=random.choice(user_agent_lists)
         )
         self.driver = None
         self._restarts = 0
@@ -591,8 +594,13 @@ class Serff:
     # Driver
     # ---------------------------------------------------------
     def start_browser(self):
+        try:
+            self.driver.quit()    
+        except:
+            pass
         logger.info("Starting Chrome WebDriver.")
         self.driver = self.browser.get_chrome()
+        self.human = Human(self.driver, speed=1.0)
         self.driver.set_page_load_timeout(self.config.page_load_timeout)
         self.config.download_dir.mkdir(parents=True, exist_ok=True)
         self.config.today_dir.mkdir(parents=True, exist_ok=True)
@@ -638,20 +646,10 @@ class Serff:
     def _click(self, locator, description, timeout=None):
         timeout = timeout or self.config.element_timeout
         element = WebDriverWait(self.driver, timeout).until(
-            EC.presence_of_element_located(locator)
-        )
-        self.driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center', behavior:'instant'});", element
-        )
-        time.sleep(0.5)
+            EC.element_to_be_clickable(locator))
         try:
-            WebDriverWait(self.driver, timeout).until(
-                EC.element_to_be_clickable(locator)
-            ).click()
+            self.human.click(element)
         except WebDriverException:
-            element = WebDriverWait(self.driver, timeout).until(
-                EC.presence_of_element_located(locator)
-            )
             self.driver.execute_script("arguments[0].click();", element)
         return element
 
@@ -773,6 +771,11 @@ class Serff:
 
             # ---- 3) HTTP 5xx ----------------------------------------------
             if self._is_server_error_page():
+                self.browser = Browser(
+                headless=False, download_dir=str(self.config.download_dir),
+                user_agent=random.choice(user_agent_lists)
+            )
+                self.start_browser()
                 logger.warning(f"HTTP 5xx detected on {url}; will refresh session and retry.")
                 raise SessionExpiredRetry(f"HTTP 5xx on {url}")
 
@@ -783,12 +786,17 @@ class Serff:
                 logger.warning(f"CAPTCHA appeared post-settle on {url}.")
                 if not self.handle_verification():
                     raise RuntimeError("Captcha could not be solved.")
-                time.sleep(2)
+                self.human.pause(1, 3)
                 return
                 
             if self._is_session_expired_page():
                 raise SessionExpiredRetry(f"session expired on {url} (post-settle)")
             if self._is_server_error_page():
+                self.browser = Browser(
+                headless=False, download_dir=str(self.config.download_dir),
+                user_agent=random.choice(user_agent_lists)
+            )
+                self.start_browser()
                 raise SessionExpiredRetry(f"HTTP 5xx on {url} (post-settle)")
 
             problem = self._page_problem()
@@ -1110,7 +1118,7 @@ class Serff:
             select_el,
         )
         self._wait_ajax_idle()
-        time.sleep(randint(1, 3))
+        time.sleep(self.human.pause(1, 3))
 
     def _read_tracking_number(self, timeout=None):
         timeout = timeout or self.config.element_timeout
@@ -1158,8 +1166,7 @@ class Serff:
 
     def _enter_date(self, locator, value, label):
         field_el = self._wait_visible(locator, f"{label} input")
-        field_el.clear()
-        field_el.send_keys(value)
+        self.human.type_text(field_el, value)
         if field_el.get_attribute("value") != value:
             self._screenshot(f"{label.replace(' ', '_').lower()}_validation")
             return False
@@ -1194,7 +1201,7 @@ class Serff:
             logger.warning("Results URL not detected; continuing.")
         time.sleep(5)
         self._scroll_to_bottom()
-        time.sleep(2)
+        self.human.pause(1, 3)
         try:
             self.wait_for_table(timeout=self.config.search_result_timeout)
         except TimeoutException:
@@ -1211,7 +1218,7 @@ class Serff:
             select_el, self.config.rows_per_page,
         )
         self._wait_ajax_idle()
-        time.sleep(2)
+        self.human.pause(1, 3)
 
     def prepare_search(self):
         self.apply_search_filters()
@@ -1308,7 +1315,10 @@ class Serff:
         if next_button is None:
             return "last"
         first_before = self._first_row_key()
-        self.driver.execute_script("arguments[0].click();", next_button)
+        try:
+            self.human.click(next_button)
+        except WebDriverException:
+            self.driver.execute_script("arguments[0].click();", next_button)
         if not self._wait_page_change(page_before, first_before):
             self._screenshot("next_page_timeout")
             return "stuck"
@@ -1324,7 +1334,10 @@ class Serff:
             links = [e for e in self.driver.find_elements(*Locators.page_link(target))
                      if e.is_displayed()]
             if links:
-                self.driver.execute_script("arguments[0].click();", links[0])
+                try:
+                    self.human.click(links[0])
+                except WebDriverException:
+                    self.driver.execute_script("arguments[0].click();", links[0])
                 if not self._wait_page_change(label_before, first_before):
                     raise RuntimeError(f"Could not jump to page {target}.")
             elif self.go_to_next_page(total_pages=total) != "moved":
@@ -1626,10 +1639,15 @@ class Serff:
             tracking_num = self._read_tracking_number()
         except RuntimeError:
             raise ZipNotAvailable("SERFF Tracking Number not readable")
+        
+        self.human.dwell(1.5, 4)
+        btn = self.driver.find_element(*Locators.DOWNLOAD_ZIP)
+        self.human.click(btn)
 
         record = self.store.records.get(data_rk)
         if record is not None:
             record["tracking_number"] = tracking_num
+
 
         self.config.code_dir(code).mkdir(parents=True, exist_ok=True)
         self._save_filing_html(code, tracking_num, row_number)
@@ -1790,7 +1808,9 @@ class Serff:
         failed = []
         for position, data_rk in enumerate(pending, start=1):
             logger.info(f"DOWNLOAD {position}/{len(pending)}")
-            if not self._download_with_recovery(data_rk, code=code, website=website):
+            ok = self._download_with_recovery(data_rk, code=code, website=website)
+            self.human.between_items(base=(4, 12))
+            if not ok:
                 failed.append(data_rk)
 
         logger.info("=" * 70)
