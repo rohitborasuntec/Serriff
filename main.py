@@ -615,6 +615,16 @@ class Serff:
         finally:
             self.driver = None
 
+    def _driver_is_alive(self):
+        """Check whether the current WebDriver still has a usable window."""
+        if self.driver is None:
+            return False
+        try:
+            return bool(self.driver.current_window_handle)
+        except Exception as exc:
+            logger.warning(f"Chrome WebDriver is unavailable: {exc}")
+            return False
+
     # ---------------------------------------------------------
     # Small wrappers
     # ---------------------------------------------------------
@@ -623,7 +633,7 @@ class Serff:
             return None
         try:
             return save_screenshot(self.driver, name)
-        except WebDriverException as exc:
+        except Exception as exc:
             logger.warning(f"Screenshot skipped ({type(exc).__name__}): {name}")
             return None
 
@@ -713,8 +723,10 @@ class Serff:
         except UnexpectedAlertPresentException:
             self._accept_alert()
             return "alert"
-        except WebDriverException:
-            # This catches InvalidSessionIdException, NoSuchWindowException, etc.
+        except Exception as exc:
+            # SeleniumBase UC can surface urllib3 connection errors when the
+            # local ChromeDriver process exits, not just WebDriverException.
+            logger.warning(f"Could not inspect current browser session: {exc}")
             return "driver_dead"
 
         haystack = f"{title}\n{text}"
@@ -744,8 +756,8 @@ class Serff:
                     self.driver.get(url)
                 except TimeoutException:
                     logger.warning("Navigation timed out. Checking current page.")
-                except WebDriverException as exc:
-                    logger.error(f"Driver failed to navigate: {exc}")
+                except Exception as exc:
+                    logger.exception(f"WebDriver failed while navigating to {url}: {exc}")
                     raise RuntimeError("driver_dead") from exc
             else:
                 logger.warning(f"Page problem '{problem}'; refresh {attempt}/{self.config.max_refreshes}.")
@@ -1062,7 +1074,11 @@ class Serff:
     def _refresh_session_same_browser(self):
         """Refresh the SERFF session without quitting Chrome.
         Hits _current_site_url -> BEGIN SEARCH -> ACCEPT (no filters)."""
-        if self.driver is None:
+        if not self._driver_is_alive():
+            logger.warning(
+                "Chrome/WebDriver is closed or disconnected; starting a fresh browser "
+                "before refreshing the SERFF session."
+            )
             self.start_browser()
         entry_url = self._current_site_url or self.config.site_home_url
         logger.info(f"REFRESH: opening {entry_url}")
@@ -1617,6 +1633,8 @@ class Serff:
     def _download_once(self, data_rk, code, row_number):
         url = self.config.filing_url(data_rk)
         self._last_filing_url = url
+        
+        logger.info(f"ROW {row_number}: Opening filing page {url}.")
         self._load_page(url)
 
         # ---------- post-load checks — CAPTCHA FIRST -----------------------
