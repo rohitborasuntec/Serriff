@@ -2,11 +2,14 @@ import os
 import platform
 from pathlib import Path
 from dotenv import load_dotenv
-load_dotenv()
-# SeleniumBase provides UC mode and proxy handling.
 from seleniumbase import Driver
-# Note: We no longer import Selenium Wire or undetected_chromedriver directly.
-# SeleniumBase bundles its own optimized version of undetected-chromedriver.
+import subprocess, sys, time
+from src.logging import logger
+import random 
+
+
+load_dotenv()
+
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -83,12 +86,12 @@ class Browser:
                 # answer the proxy's auth challenge. Standard Chrome correctly
                 # loads SeleniumBase's proxy-auth extension.
                 driver_kwargs["uc"] = False
-                print("[chrome] Authenticated proxy detected; using standard Chrome for proxy authentication.")
+                logger.info("[chrome] Authenticated proxy detected; using standard Chrome for proxy authentication.")
             display_proxy = (
                 f"***@{proxy_str.rsplit('@', 1)[1]}"
                 if "@" in proxy_str else proxy_str
             )
-            print(f"[chrome] Using proxy: {display_proxy}")
+            logger.info(f"[chrome] Using proxy: {display_proxy}")
 
         # 3. User Agent
         if self.user_agent:
@@ -146,8 +149,8 @@ if __name__ == "__main__":
     driver = browser.get_chrome()
     try:
         driver.get("https://httpbin.org/ip")
-        print("Page title:", driver.title)
-        print("\n--- Page Text (IP Check) ---")
-        print(driver.find_element("tag name", "body").text)
+        logger.info("Page title:", driver.title)
+        logger.info("\n--- Page Text (IP Check) ---")
+        logger.info(driver.find_element("tag name", "body").text)
     finally:
         browser.quit()
