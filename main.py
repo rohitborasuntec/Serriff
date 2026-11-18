@@ -594,10 +594,11 @@ class Serff:
     # Driver
     # ---------------------------------------------------------
     def start_browser(self):
-        try:
-            self.driver.quit()    
-        except:
-            pass
+        # try:
+        #     if new_browser:
+        #         self.driver.quit()    
+        # except:
+        #     pass
         logger.info("Starting Chrome WebDriver.")
         self.driver = self.browser.get_chrome()
         self.human = Human(self.driver, speed=1.0)
@@ -703,7 +704,7 @@ class Serff:
         """True if the page is a SERFF HTTP 5xx error page."""
         try:
             html = (self.driver.page_source or "").lower()
-            if "http 500" in html or "http 502" in html or "http 503" in html or "http 504" in html:
+            if "http 500" in html or "http 502" in html or "http 503" in html or "http 504" in html or "you are not authorized to view this content." in html :
                 return True
             if "internal server error" in html or "bad gateway" in html or "service unavailable" in html:
                 return True
@@ -753,7 +754,12 @@ class Serff:
         for attempt in range(self.config.max_refreshes + 1):
             if attempt == 0:
                 try:
-                    self.driver.get(url)
+                    # SeleniumBase UC replaces ``get`` with a helper that may
+                    # open/close tabs after its response probe. Use its saved
+                    # original WebDriver navigation; challenge pages are still
+                    # inspected and handled by the checks below.
+                    navigate = getattr(self.driver, "default_get", self.driver.get)
+                    navigate(url)
                 except TimeoutException:
                     logger.warning("Navigation timed out. Checking current page.")
                 except Exception as exc:
@@ -783,11 +789,11 @@ class Serff:
 
             # ---- 3) HTTP 5xx ----------------------------------------------
             if self._is_server_error_page():
-                self.browser = Browser(
-                headless=False, download_dir=str(self.config.download_dir),
-                user_agent=random.choice(user_agent_lists)
-            )
-                self.start_browser()
+            #     self.browser = Browser(
+            #     headless=False, download_dir=str(self.config.download_dir),
+            #     user_agent=random.choice(user_agent_lists)
+            # )
+                # self.start_browser()
                 logger.warning(f"HTTP 5xx detected on {url}; will refresh session and retry.")
                 raise SessionExpiredRetry(f"HTTP 5xx on {url}")
 
@@ -954,6 +960,7 @@ class Serff:
             self._screenshot("accept_terms_stuck")
             return False
         logger.info(f"STEP 4: Clicking ACCEPT (attempt {6 - attempt}/5).")
+
         try:
             self._wait_with_refresh(Locators.ACCEPT, "ACCEPT button", condition="presence")
             self._click(Locators.ACCEPT, "ACCEPT button")
@@ -967,7 +974,7 @@ class Serff:
         if not self.handle_verification():
             return False
         try:
-            WebDriverWait(self.driver, 5).until(
+            WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located(
                     (By.XPATH, "//*[contains(normalize-space(.), 'Filing Search')]")
                 )
@@ -1051,19 +1058,19 @@ class Serff:
             except Exception:
                 logger.exception(f"Session set-up failed (attempt {attempt}).")
                 self._screenshot("session_setup_failure")
-                
-                # --- REUSE THE SAME BROWSER ---
-                # Do NOT call self.close(). Just try to reset the page.
-                if self.driver is not None:
+
+                # A failed UC/tab navigation can leave a WebDriver object
+                # whose Chrome window is already gone. Recreate it instead of
+                # retrying navigation through a dead session.
+                if not self._driver_is_alive():
+                    self.start_browser()
+                else:
                     try:
                         target_url = url or self._current_site_url or self.config.site_home_url
                         logger.info(f"Restarting session flow by re-hitting: {target_url}")
                         self._load_page(target_url)
                     except Exception:
                         logger.exception("Failed to reload page; will retry anyway.")
-                else:
-                    # Only start a new browser if it was already dead
-                    self.start_browser()
             
             time.sleep(self.config.restart_cooldown * attempt)
             
@@ -1636,7 +1643,6 @@ class Serff:
         
         logger.info(f"ROW {row_number}: Opening filing page {url}.")
         self._load_page(url)
-
         # ---------- post-load checks — CAPTCHA FIRST -----------------------
         # (SERFF sometimes flips to a captcha a moment after the page loads.)
         if self._is_verification_page():
@@ -1652,27 +1658,24 @@ class Serff:
 
         if self._is_server_error_page():
             raise SessionExpiredRetry(f"HTTP 5xx on filing page {url}")
-
         try:
             tracking_num = self._read_tracking_number()
         except RuntimeError:
             raise ZipNotAvailable("SERFF Tracking Number not readable")
-        
         self.human.dwell(1.5, 4)
-        btn = self.driver.find_element(*Locators.DOWNLOAD_ZIP)
-        self.human.click(btn)
-
         record = self.store.records.get(data_rk)
         if record is not None:
             record["tracking_number"] = tracking_num
 
-
         self.config.code_dir(code).mkdir(parents=True, exist_ok=True)
         self._save_filing_html(code, tracking_num, row_number)
 
-        if not self.driver.find_elements(*Locators.DOWNLOAD_ZIP):
+        download_buttons = self.driver.find_elements(*Locators.DOWNLOAD_ZIP)
+        if not download_buttons:
             self._screenshot(f"no_download_button_row_{row_number}")
-            raise ZipNotAvailable("Download ZIP button not present on page")
+            raise ZipNotAvailable("Download ZIP button not present on filing page")
+
+        self.human.click(download_buttons[0])
 
         # ... rest of the method unchanged
 
@@ -1700,7 +1703,6 @@ class Serff:
 
         attempt = 0                 # real-failure counter
         session_retries = 0         # session-refresh counter (does not consume `attempt`)
-
         while attempt < max_tries:
             attempt += 1
             logger.info("=" * 70)
@@ -1804,14 +1806,14 @@ class Serff:
         pending = self.store.pending_keys()
         skipped_count = len(self.store.progress.get("skipped_data_rk") or {})
         total_records = len(self.store.records)
-
+        
         logger.info("=" * 70)
         logger.info(
             f"DOWNLOAD PHASE: {len(pending)} pending of {total_records} filing id(s); "
             f"completed={self.store.completed_count}, skipped={skipped_count}."
         )
         logger.info("=" * 70)
-
+        
         if total_records == 0:
             logger.warning("No filing IDs collected for this row; marking the row Partial.")
             return False
@@ -1830,7 +1832,6 @@ class Serff:
             self.human.between_items(base=(4, 12))
             if not ok:
                 failed.append(data_rk)
-
         logger.info("=" * 70)
         logger.info(
             f"DOWNLOAD PHASE FINISHED. completed={self.store.completed_count}/{total_records}, "
@@ -1953,7 +1954,9 @@ class Serff:
                     try:
                         if self.driver is None:
                             self.start_browser()
+
                         self._refresh_session_same_browser()
+
                     except SessionAbort as exc:
                         logger.error(f"RESUME MODE: session refresh failed: {exc}")
                         self._stamp_row(df, index, False)
